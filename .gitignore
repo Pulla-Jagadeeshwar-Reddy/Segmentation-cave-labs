@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+.idea/
+
+# Point clouds
+*.ply
+*.pcd
+
+# Meshes
+*.obj
+*.stl
+*.glb
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# COLMAP
+database.db
+sparse/
+dense/
+
+# Generated outputs
+output/
+outputs/
+results/
+cache/
+
+# Videos
+*.mp4
+*.avi
