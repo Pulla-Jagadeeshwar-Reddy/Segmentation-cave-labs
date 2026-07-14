@@ -990,32 +990,45 @@ class CombinedScene:
                                             # (applied to job.gauss on export —
                                             #  see _apply_rotation / _export_gaussians)
 
-        # ── CHANGE 14 — directional shadow-map shading ──────────────────────
-        # Replaces the old "overhead coverage" proxy (which counted room
-        # points in a vertical column above each object point, with no sense
-        # of direction — so anything nearby in XY, at any angle, could get
-        # miscounted as "overhead" and produce blotchy, physically
-        # meaningless dark patches). This version picks ONE light direction
-        # (like a sun position: azimuth + elevation) and builds a real
-        # shadow map against it: project the room into "light space," keep
-        # the nearest-to-light depth per grid cell, and compare each object
-        # point's own depth against its cell to see if something already
-        # blocks the light before it gets there. See _build_light_basis /
-        # _build_shadow_map / _compute_directional_darken for the mechanics.
-        self.LIGHT_AZIMUTH_DEG   = 40.0   # compass angle of the light around +Z (0 = +X)
-        self.LIGHT_ELEVATION_DEG = 55.0   # angle above the horizon (90 = straight down)
-        self.SHADOW_CELL_FRAC    = 0.008  # shadow-map texel size, as a fraction of room scale
-        self.SHADOW_BIAS_FRAC    = 0.004  # depth bias (fraction of room scale) to prevent
-                                           # a point from "self-shadowing" due to float noise
-        self.SHADOW_STRENGTH     = 0.65   # max darkening in full shadow (0=no effect, 1=black)
-        self.SHADOW_SOFT_TAPS    = 1      # 0 = hard shadow edge, 1 = 3x3 soft sampling,
-                                           # 2 = 5x5 (softer penumbra, a bit more compute)
+        # ── CHANGE 15 — directional shadow via light-space KD-tree ──────────
+        # (CHANGE 14's grid/hash shadow-map had two real bugs: the folded
+        # integer cell key `cu*M + cv` isn't collision-safe for arbitrary
+        # cv, and a grid cell finer than the room's actual point spacing
+        # left "holes" — cells with no room point even where a real
+        # surface sits, which silently read as "nothing there, fully lit."
+        # Both produced patchy, wrong-looking shadows.)
+        #
+        # This version drops the grid entirely and does a KD-tree radius
+        # search directly in light-space (u, v) — the same proven
+        # query_ball_point mechanism the ORIGINAL overhead-proxy used, just
+        # projected onto the light's plane instead of raw world XY, and
+        # compared along the light ray instead of raw Z height. A radius
+        # search naturally tolerates sparse/uneven point density, since it
+        # finds whatever real points are nearby instead of relying on them
+        # landing in one exact cell.
+        self.LIGHT_AZIMUTH_DEG    = 40.0   # compass angle of the light around +Z (0 = +X)
+        self.LIGHT_ELEVATION_DEG  = 55.0   # angle above the horizon (90 = straight down)
+        self.SHADOW_RADIUS_FRAC   = 0.02   # width (fraction of room scale) of the
+                                            # light-space column searched around each point
+        self.SHADOW_BIAS_FRAC     = 0.004  # depth bias (fraction of room scale) so a point
+                                            # doesn't "shadow itself" from float noise
+        self.SHADOW_SATURATE_COUNT = 12    # occluding-neighbor count that = full shadow
+        self.SHADOW_STRENGTH      = 0.65   # max darkening in full shadow (0=no effect, 1=black)
+        self.ENABLE_SELF_SHADOW   = False  # CHANGE 16: object shadowing its OWN points is
+                                            # OFF by default — see _compute_directional_darken
+                                            # docstring. Bushy/cluttered objects (foliage, a
+                                            # vase of flowers) saturate almost instantly and
+                                            # end up darkened everywhere regardless of light
+                                            # direction. Only enable for solid, simple,
+                                            # genuinely concave objects.
+        self.SELF_SHADOW_RADIUS_FRAC = 0.05  # fraction of the OBJECT's own size (not the
+                                              # room's) — only used if ENABLE_SELF_SHADOW
+        self.SELF_SHADOW_BIAS_FRAC   = 0.02  # fraction of the OBJECT's own size
         self.light_dir = None
         self.u_axis = None
         self.v_axis = None
-        self.shadow_cell = None
-        self.shadow_keys = None       # sorted unique light-space cell keys (room, static)
-        self.shadow_min_depth = None  # matching nearest-to-light depth per cell
+        self.room_shadow_tree = None   # cKDTree over room points' (u, v) light-space coords
+        self.room_light_depth = None   # matching light-space depth, one per room point
         self.last_occlusion_darken = None  # CHANGE 12: cached per-point darken
                                             # array from the most recent shading
                                             # pass, reused at export time so the
@@ -1023,7 +1036,7 @@ class CombinedScene:
         self.room_scale = float(np.linalg.norm(
             self.room_pcd.get_axis_aligned_bounding_box().get_extent()))
         self._build_light_basis()
-        self._build_shadow_map()
+        self._build_shadow_tree()
 
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(window_name="Scene — room + movable splat object",
@@ -1081,62 +1094,33 @@ class CombinedScene:
         return u, v, depth
 
     @staticmethod
-    def _bin_min_depth(u, v, depth, cell):
-        """
-        Grids (u, v) into `cell`-sized cells and reduces to the MINIMUM
-        depth per cell — i.e. for every light-space "pixel," the depth of
-        the first surface the light hits. This is a standard shadow map,
-        just built with plain vectorized numpy instead of a rasterizer.
-        Returns (sorted unique cell keys, matching min-depth array).
-        """
-        cu = np.floor(u / cell).astype(np.int64)
-        cv = np.floor(v / cell).astype(np.int64)
-        # Fold the 2D cell coords into 1 integer key so we can sort once
-        # and reduce in one pass, instead of a Python-level dict per point.
-        # 2,000,003 is prime and comfortably larger than any plausible
-        # cv spread, so (cu, cv) pairs don't collide onto the same key.
-        key = cu * 2_000_003 + cv
+    def _light_uv(u, v):
+        return np.stack([u, v], axis=1)
 
-        order = np.argsort(key, kind="stable")
-        key_sorted = key[order]
-        depth_sorted = depth[order]
-        uniq_keys, first_idx = np.unique(key_sorted, return_index=True)
-        min_depth = np.minimum.reduceat(depth_sorted, first_idx)
-        return uniq_keys, min_depth
-
-    @staticmethod
-    def _lookup_min_depth(keys, uniq_keys, min_depth):
-        """Vectorized 'dict' lookup via searchsorted: cells with no entry
-        come back as +inf (nothing there to occlude — open sky)."""
-        idx = np.searchsorted(uniq_keys, keys)
-        idx = np.clip(idx, 0, max(len(uniq_keys) - 1, 0))
-        out = np.full(keys.shape, np.inf)
-        if len(uniq_keys) > 0:
-            found = uniq_keys[idx] == keys
-            out[found] = min_depth[idx[found]]
-        return out
-
-    def _build_shadow_map(self):
+    def _build_shadow_tree(self):
         """
-        Builds the STATIC part of the shadow map from the room alone.
+        Builds the STATIC part of the directional shadow test from the
+        room alone: every room point's light-space (u, v) position goes
+        into a KD-tree, and its light-space depth is kept alongside it.
         Built once in __init__ since the room is never edited or moved in
-        this tool — every later shading pass reuses this and only has to
-        project/bin the small, currently-moving object cloud on top of it.
+        this tool — every later shading pass reuses this tree and only
+        has to project/query the small, currently-moving object cloud
+        against it.
         """
         pts = np.asarray(self.room_pcd.points)
         if len(pts) == 0:
-            self.shadow_cell = None
+            self.room_shadow_tree = None
+            self.room_light_depth = None
             return
-        self.shadow_cell = max(self.room_scale * self.SHADOW_CELL_FRAC, 1e-4)
         u, v, depth = self._to_light_space(pts)
-        self.shadow_keys, self.shadow_min_depth = self._bin_min_depth(
-            u, v, depth, self.shadow_cell)
+        self.room_light_depth = depth
+        self.room_shadow_tree = cKDTree(self._light_uv(u, v))
 
-    # ── CHANGE 14 — pure computation, no viewer side-effects, no lag ───────
+    # ── CHANGE 15 — pure computation, no viewer side-effects, no lag ───────
     def _compute_directional_darken(self):
         """
         Returns the per-point darken array for the object's CURRENT
-        position, using a real directional shadow map instead of the old
+        position, using a directional shadow test instead of the old
         overhead-count proxy. Does NOT touch obj_geom.colors or call
         update_geometry — safe to call as often or as rarely as you like.
 
@@ -1146,49 +1130,81 @@ class CombinedScene:
         handlers.
 
         Method: project every current object point into light space
-        (u, v, depth). Look up the nearest-to-light depth recorded for
-        that (u, v) cell in TWO maps — the static room map built once in
-        __init__, and a fresh map built from the object's OWN current
-        points (so a concave object can shadow itself too, e.g. a seat
-        shadowing the legs beneath it). Take whichever is nearer the
-        light. If the point's own depth is further from the light than
-        that nearest surface (beyond a small bias, to avoid a point
-        "shadowing itself" from float noise), it's in shadow.
+        (u, v, depth), where smaller depth = closer to the light. For
+        each point, do a radius search in (u, v) — i.e. "look along the
+        light ray" — against the static room's KD-tree (built once).
+        Any room point whose depth is smaller (closer to the light) than
+        this point's own depth, by more than a small bias, is something
+        already blocking the light before it reaches this point — count
+        it as an occluder. The occluder count saturates into a soft
+        darkening factor, the same way the original overhead-proxy's
+        point count did, just now restricted to the correct light-space
+        column instead of a raw vertical one.
 
-        A handful of neighboring cells (SHADOW_SOFT_TAPS) are sampled and
-        averaged so shadow edges fall off softly instead of aliasing hard
-        cell boundaries.
+        A KD-tree radius search (rather than binning into a fixed grid)
+        is what makes this robust on sparse/uneven point clouds: it finds
+        whatever real points are actually nearby instead of requiring
+        them to land in one exact cell, so it doesn't leave "holes" that
+        silently read as unoccluded.
+
+        CHANGE 16 — self-shadow is OFF by default (ENABLE_SELF_SHADOW).
+        A prior version always let the object shadow its own points too
+        (for concave objects like a seat shadowing its own legs). That
+        backfires badly on bushy/cluttered objects — a vase of flowers,
+        foliage, anything with lots of thin overlapping geometry — because
+        nearby points at slightly different depths trip the occluder
+        count almost everywhere, saturating it regardless of light
+        direction. That's what "changing the light angle does nothing"
+        looks like: the object is darkening itself, not the room. Turn
+        ENABLE_SELF_SHADOW back on only for solid, simple, genuinely
+        concave objects where you've confirmed it helps.
         """
-        if self.obj_geom is None or self.shadow_cell is None or self.obj_base_colors is None:
+        if self.obj_geom is None or self.obj_base_colors is None:
             return None
 
         pts = np.asarray(self.obj_geom.points)
-        cell = self.shadow_cell
+        n = len(pts)
         u, v, depth = self._to_light_space(pts)
-        cu = np.floor(u / cell).astype(np.int64)
-        cv = np.floor(v / cell).astype(np.int64)
+        uv = self._light_uv(u, v)
 
-        # Self-occlusion map: only the object's own (small) point set, so
-        # rebuilding this every call is negligible next to the room.
-        obj_keys, obj_min_depth = self._bin_min_depth(u, v, depth, cell)
+        radius = max(self.room_scale * self.SHADOW_RADIUS_FRAC, 1e-4)
+        bias   = max(self.room_scale * self.SHADOW_BIAS_FRAC, 1e-5)
 
-        bias = max(self.room_scale * self.SHADOW_BIAS_FRAC, 1e-5)
-        taps = range(-self.SHADOW_SOFT_TAPS, self.SHADOW_SOFT_TAPS + 1)
+        room_hits = (self.room_shadow_tree.query_ball_point(uv, r=radius, workers=-1)
+                     if self.room_shadow_tree is not None else [[] for _ in range(n)])
 
-        occluded_votes = np.zeros(len(pts), dtype=np.float64)
-        n_taps = 0
-        for du in taps:
-            for dv in taps:
-                key = (cu + du) * 2_000_003 + (cv + dv)
-                room_depth = self._lookup_min_depth(
-                    key, self.shadow_keys, self.shadow_min_depth)
-                self_depth = self._lookup_min_depth(key, obj_keys, obj_min_depth)
-                nearest_to_light = np.minimum(room_depth, self_depth)
-                occluded_votes += (depth > nearest_to_light + bias)
-                n_taps += 1
+        if self.ENABLE_SELF_SHADOW and n > 1:
+            # Self-occlusion uses the OBJECT's own scale for radius/bias,
+            # not the room's — a vase is far smaller than the room, and
+            # sizing its own self-shadow test off the room's scale is what
+            # made it saturate almost instantly. Even with this fix,
+            # leave it off for cluttered objects; see docstring above.
+            obj_scale = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+            self_radius = max(obj_scale * self.SELF_SHADOW_RADIUS_FRAC, 1e-5)
+            self_bias   = max(obj_scale * self.SELF_SHADOW_BIAS_FRAC, 1e-6)
+            self_tree = cKDTree(uv)
+            self_hits = self_tree.query_ball_point(uv, r=self_radius, workers=-1)
+        else:
+            self_hits = None
+            self_bias = bias  # unused when self_hits is None
 
-        shadow_fraction = occluded_votes / n_taps  # 0 = fully lit, 1 = fully shadowed
-        return 1.0 - shadow_fraction[:, None] * self.SHADOW_STRENGTH
+        darken = np.ones(n, dtype=np.float64)
+        for i in range(n):
+            occluding = 0
+            room_idx = room_hits[i]
+            if room_idx:
+                occluding += int(np.count_nonzero(
+                    self.room_light_depth[room_idx] < depth[i] - bias))
+            if self_hits is not None:
+                self_idx = self_hits[i]
+                if self_idx:
+                    occluding += int(np.count_nonzero(
+                        depth[self_idx] < depth[i] - self_bias))
+            if occluding:
+                shadow_fraction = min(occluding / self.SHADOW_SATURATE_COUNT, 1.0)
+                darken[i] = 1.0 - shadow_fraction * self.SHADOW_STRENGTH
+
+        return darken[:, None]
 
     def _apply_occlusion_shading(self, vis=None):
         """
