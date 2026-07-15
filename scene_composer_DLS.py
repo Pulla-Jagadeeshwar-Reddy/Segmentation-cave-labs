@@ -270,55 +270,282 @@ def build_cluster_meta(pcd, labels, n_clusters):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Step 1 — picker GUI (single-select "object" + Continue)
+# Step 1 — Clustering Workbench: ground-removal + DBSCAN controls, multi-select
+#          cluster picker, isolated preview window, and a rectangle/lasso
+#          clean-up tool for stray points
 # ════════════════════════════════════════════════════════════════════════════
+#
+# Replaces the old single-shot "cluster once, pick exactly one cluster" flow
+# with an interactive loop:
+#   1. Toggle ground-plane removal on/off (+ threshold slider) and re-cluster.
+#   2. Tune DBSCAN eps / min_points with sliders and re-cluster as many times
+#      as you like.
+#   3. Multi-select any number of clusters — they'll be moved together as one
+#      object.
+#   4. Preview the current selection, isolated, in its own read-only 3D window.
+#   5. Clean up stray points in the selection with a rectangle + lasso tool.
+# Pressing Continue hands (pcd, labels, n_clusters, obj_mask, nonground_src_idx,
+# ground_src_idx, ground_pcd) onward — same shape of handoff the old picker
+# made, just with `obj_mask` now representing "every point you actually
+# want", however many clusters and clean-up passes it took to get there.
 
-class ObjectPickerApp:
-    """Minimal single-selection variant of point_cloud_gui's ClusterApp.
-    Takes already-loaded/clustered data (shared with the labeled 3D overview
-    so the scene isn't loaded/clustered twice)."""
+_ensure("matplotlib")
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import RectangleSelector, LassoSelector
+from matplotlib.path import Path as MplPath
 
-    def __init__(self, root, pcd, labels, n_clusters, palette, cluster_meta, on_continue,
-                 preselect_cid=None):
-        self.root         = root
-        self.pcd          = pcd
-        self.labels       = labels
-        self.n_clusters   = n_clusters
-        self.palette      = palette
-        self.cluster_meta = cluster_meta
-        self.on_continue  = on_continue
-        self.selected_cid = None
-        self.preselect_cid = preselect_cid
 
-        root.title("Pick the object to extract")
+class CleanupTool:
+    """
+    Rectangle + lasso combo for removing stray points from the currently
+    selected cluster(s). Nothing is deleted from the scene — points you mark
+    and remove here are simply excluded from the final object mask, so they
+    stay part of the room. Works on a 2D projection of the selection (top/
+    front/side) since that's what rectangle/lasso selection needs.
+    """
+    PLANES = {"Top (X/Y)": (0, 1), "Front (X/Z)": (0, 2), "Side (Y/Z)": (1, 2)}
+
+    def __init__(self, parent, pts, colors, global_idx, on_done):
+        """
+        pts, colors : Nx3 arrays for the CURRENT selection only.
+        global_idx  : row-index of each of these N points back into the
+                       workbench's `pcd` — what on_done() reports as removed.
+        on_done     : callback(removed_global_idx: np.ndarray), fired once,
+                       when the tool window is closed.
+        """
+        self.pts = pts
+        self.colors = colors if colors is not None else np.tile([0.9, 0.6, 0.15], (len(pts), 1))
+        self.global_idx = global_idx
+        self.on_done = on_done
+        self.marked = set()     # local indices, currently boxed/lassoed
+        self.removed = set()    # local indices, confirmed removed
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("Clean up selection — rectangle or lasso, then Remove")
+        self.win.geometry("980x760")
+        self.win.protocol("WM_DELETE_WINDOW", self._finish)
+
+        top = tk.Frame(self.win); top.pack(fill="x", padx=8, pady=6)
+        tk.Label(top, text="Projection:").pack(side="left")
+        self.plane_var = tk.StringVar(value="Top (X/Y)")
+        tk.OptionMenu(top, self.plane_var, *self.PLANES.keys(),
+                      command=lambda _=None: self._redraw()).pack(side="left", padx=6)
+
+        self.mode_var = tk.StringVar(value="rect")
+        tk.Radiobutton(top, text="Rectangle", variable=self.mode_var, value="rect",
+                        command=self._set_mode).pack(side="left", padx=(20, 4))
+        tk.Radiobutton(top, text="Lasso", variable=self.mode_var, value="lasso",
+                        command=self._set_mode).pack(side="left", padx=4)
+
+        tk.Button(top, text="Clear marks", command=self._clear_marks).pack(side="left", padx=(20, 4))
+        tk.Button(top, text="Remove marked points", bg="#5f1e1e", fg="white",
+                  command=self._remove_marked).pack(side="left", padx=4)
+        tk.Button(top, text="Done", command=self._finish).pack(side="right", padx=4)
+
+        self.status = tk.Label(self.win, text="", anchor="w")
+        self.status.pack(fill="x", padx=8)
+
+        self.fig, self.ax = plt.subplots(figsize=(8, 7))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._redraw()
+
+    # ── drawing ──────────────────────────────────────────────────────────
+    def _live_mask(self):
+        """Bool mask over self.pts of points still 'live' (not removed)."""
+        live = np.ones(len(self.pts), dtype=bool)
+        if self.removed:
+            live[list(self.removed)] = False
+        return live
+
+    def _redraw(self):
+        self.ax.clear()
+        a, b = self.PLANES[self.plane_var.get()]
+        live = self._live_mask()
+        xy_live = np.stack([self.pts[live, a], self.pts[live, b]], axis=1)
+        cols_live = self.colors[live]
+        self._scatter_idx = np.where(live)[0]   # local idx of each plotted point
+        self.ax.scatter(xy_live[:, 0], xy_live[:, 1], c=cols_live, s=4)
+
+        marked_live = [i for i in self.marked if live[i]]
+        if marked_live:
+            mk = np.stack([self.pts[marked_live, a], self.pts[marked_live, b]], axis=1)
+            self.ax.scatter(mk[:, 0], mk[:, 1], facecolors="none",
+                             edgecolors="red", s=30, linewidths=1.2)
+
+        self.ax.set_aspect("equal", adjustable="datalim")
+        self.ax.set_title(f"{int(live.sum()):,} pts shown  |  {len(self.marked):,} marked  |  "
+                           f"{len(self.removed):,} removed so far")
+        self._install_selectors()
+        self.canvas.draw_idle()
+        self.status.config(text="Drag to select (rectangle or lasso mode above), "
+                                 "then 'Remove marked points'. Close window when done.")
+
+    def _install_selectors(self):
+        self._rect_sel = RectangleSelector(
+            self.ax, self._on_rect, useblit=True, button=[1], interactive=False)
+        self._lasso_sel = LassoSelector(self.ax, self._on_lasso, button=[1])
+        self._set_mode()
+
+    def _set_mode(self):
+        if not hasattr(self, "_rect_sel"):
+            return
+        is_rect = self.mode_var.get() == "rect"
+        self._rect_sel.set_active(is_rect)
+        self._lasso_sel.set_active(not is_rect)
+
+    # ── selection callbacks ─────────────────────────────────────────────
+    def _current_xy(self):
+        a, b = self.PLANES[self.plane_var.get()]
+        return np.stack([self.pts[self._scatter_idx, a],
+                          self.pts[self._scatter_idx, b]], axis=1)
+
+    def _on_rect(self, eclick, erelease):
+        x0, x1 = sorted([eclick.xdata, erelease.xdata])
+        y0, y1 = sorted([eclick.ydata, erelease.ydata])
+        xy = self._current_xy()
+        inside = (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+        self.marked.update(self._scatter_idx[inside].tolist())
+        self._redraw()
+
+    def _on_lasso(self, verts):
+        path = MplPath(verts)
+        xy = self._current_xy()
+        inside = path.contains_points(xy)
+        self.marked.update(self._scatter_idx[inside].tolist())
+        self._redraw()
+
+    def _clear_marks(self):
+        self.marked.clear()
+        self._redraw()
+
+    def _remove_marked(self):
+        self.removed.update(self.marked)
+        self.marked.clear()
+        self._redraw()
+
+    def _finish(self):
+        removed_global = (self.global_idx[list(self.removed)]
+                           if self.removed else np.array([], dtype=np.int64))
+        plt.close(self.fig)
+        self.win.destroy()
+        self.on_done(removed_global)
+
+
+class ClusteringWorkbench:
+    """
+    Interactive replacement for the old single-shot "cluster once, pick one
+    cluster" flow. See the Step 1 header comment above for the full feature
+    list. `on_continue(pcd, labels, n_clusters, obj_mask, nonground_src_idx,
+    ground_src_idx, ground_pcd)` fires once, when Continue is pressed.
+    """
+
+    def __init__(self, root, pcd_full, on_continue):
+        self.root = root
+        self.pcd_full = pcd_full
+        self.on_continue_cb = on_continue
+
+        # Current working state — replaced wholesale every time
+        # "Run clustering" is pressed.
+        self.pcd = pcd_full
+        self.labels = None
+        self.n_clusters = 0
+        self.palette = None
+        self.cluster_meta = {}
+        self.nonground_src_idx = np.arange(len(np.asarray(pcd_full.points)))
+        self.ground_src_idx = np.array([], dtype=np.int64)
+        self.ground_pcd = o3d.geometry.PointCloud()
+        self.removed_idx = set()   # global row indices into self.pcd, cleaned out
+
+        root.title("Clustering Workbench")
         root.configure(bg="#14151f")
-        root.geometry("340x560")
+        root.geometry("420x780")
         self._build_ui()
-        self._populate()
+        self._run_clustering()   # initial pass with default settings
 
-    # ── UI ───────────────────────────────────────────────────────────────────
+    # ── UI ───────────────────────────────────────────────────────────────
     def _build_ui(self):
         BG, FG = "#14151f", "#e0e4f5"
-        f = tk.Frame(self.root, bg=BG, padx=14, pady=10)
+        f = tk.Frame(self.root, bg=BG, padx=12, pady=10)
         f.pack(fill="both", expand=True)
 
-        tk.Label(f, text="CLUSTERS (pick one — IDs match the 3D overview)",
-                 bg=BG, fg="#6a7fc1", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        # -- Ground removal ---------------------------------------------------
+        tk.Label(f, text="GROUND REMOVAL", bg=BG, fg="#6a7fc1",
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.ground_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(f, text="Enable (plane-segment + strip floor)",
+                        variable=self.ground_var, bg=BG, fg=FG,
+                        selectcolor="#1e1f2e", activebackground=BG,
+                        command=self._on_ground_toggle).pack(anchor="w")
+        self.ground_thresh_var = tk.DoubleVar(value=0.10)
+        self.ground_slider = tk.Scale(
+            f, from_=0.01, to=1.0, resolution=0.01, orient="horizontal",
+            variable=self.ground_thresh_var, label="Plane distance threshold",
+            bg=BG, fg=FG, troughcolor="#1e1f2e", highlightthickness=0,
+            state="disabled")
+        self.ground_slider.pack(fill="x", pady=(2, 10))
 
+        # -- DBSCAN -------------------------------------------------------------
+        tk.Label(f, text="DBSCAN", bg=BG, fg="#6a7fc1",
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        self.auto_eps_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(f, text="Auto eps (recommended starting point)",
+                        variable=self.auto_eps_var, bg=BG, fg=FG,
+                        selectcolor="#1e1f2e", activebackground=BG,
+                        command=self._on_auto_eps_toggle).pack(anchor="w")
+        self.eps_var = tk.DoubleVar(value=0.10)
+        self.eps_slider = tk.Scale(
+            f, from_=0.01, to=2.0, resolution=0.01, orient="horizontal",
+            variable=self.eps_var, label="eps (neighborhood radius)",
+            bg=BG, fg=FG, troughcolor="#1e1f2e", highlightthickness=0,
+            state="disabled")
+        self.eps_slider.pack(fill="x", pady=(2, 6))
+
+        self.min_pts_var = tk.IntVar(value=60)
+        self.min_pts_slider = tk.Scale(
+            f, from_=5, to=300, resolution=1, orient="horizontal",
+            variable=self.min_pts_var, label="min_points",
+            bg=BG, fg=FG, troughcolor="#1e1f2e", highlightthickness=0)
+        self.min_pts_slider.pack(fill="x", pady=(2, 8))
+
+        tk.Button(f, text="Run clustering ▶", command=self._run_clustering,
+                  bg="#1e3a5f", fg=FG, activebackground="#2a4d7a",
+                  relief="flat", padx=8, pady=6, cursor="hand2").pack(fill="x", pady=(0, 10))
+
+        # -- Cluster list ---------------------------------------------------------
+        tk.Label(f, text="CLUSTERS (ctrl/shift-click to select more than one)",
+                 bg=BG, fg="#6a7fc1", font=("Segoe UI", 8, "bold")).pack(anchor="w")
         lf = tk.Frame(f, bg=BG); lf.pack(fill="both", expand=True, pady=4)
         sb = tk.Scrollbar(lf, orient="vertical")
         self.clist = tk.Listbox(lf, bg="#1e1f2e", fg=FG, selectbackground="#353850",
                                  selectforeground=FG, relief="flat", bd=0,
                                  font=("Consolas", 9), exportselection=False,
-                                 yscrollcommand=sb.set)
+                                 selectmode="extended", yscrollcommand=sb.set)
         sb.config(command=self.clist.yview)
         self.clist.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.clist.bind("<<ListboxSelect>>", self._on_select)
+        self.clist.bind("<<ListboxSelect>>", lambda _e: self._update_status())
+
+        tk.Button(f, text="Identify by shift-click on 3D scene …",
+                  command=self._on_identify_click, bg="#1e1f2e", fg=FG,
+                  relief="flat", padx=6, pady=4, cursor="hand2").pack(fill="x", pady=(6, 4))
+
+        btn_row = tk.Frame(f, bg=BG); btn_row.pack(fill="x", pady=(2, 4))
+        tk.Button(btn_row, text="Preview selected", command=self._on_preview,
+                  bg="#1e1f2e", fg=FG, relief="flat", padx=6, pady=6,
+                  cursor="hand2").pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="Clean up selected", command=self._on_cleanup,
+                  bg="#1e1f2e", fg=FG, relief="flat", padx=6, pady=6,
+                  cursor="hand2").pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         self.status = tk.Label(f, text="", bg=BG, fg="#7a80a0",
-                                font=("Segoe UI", 9), anchor="w")
-        self.status.pack(fill="x", pady=(4, 8))
+                                font=("Segoe UI", 9), anchor="w", justify="left",
+                                wraplength=380)
+        self.status.pack(fill="x", pady=(6, 8))
 
         self.continue_btn = tk.Button(
             f, text="Continue ▶", state="disabled", command=self._continue,
@@ -326,67 +553,201 @@ class ObjectPickerApp:
             padx=10, pady=8, cursor="hand2")
         self.continue_btn.pack(fill="x")
 
-    def _populate(self):
+    def _on_ground_toggle(self):
+        self.ground_slider.config(state="normal" if self.ground_var.get() else "disabled")
+
+    def _on_auto_eps_toggle(self):
+        self.eps_slider.config(state="disabled" if self.auto_eps_var.get() else "normal")
+
+    # ── clustering ─────────────────────────────────────────────────────────
+    def _run_clustering(self):
+        self.status.config(text="Clustering …")
+        self.root.update_idletasks()
+
+        if self.ground_var.get():
+            # CHANGE — exact index bookkeeping. The previous version called
+            # pcg.remove_ground() (which only returns a bare PointCloud, no
+            # indices) and then reconstructed nonground_src_idx/ground_src_idx
+            # by nearest-neighbor-matching pcd_no_ground's points back against
+            # pcd_full (_extract_ground_mask). On scans with duplicate or
+            # near-duplicate point coordinates, that distance-based matching
+            # can misclassify a handful of points, so the reconstructed index
+            # arrays end up a few elements longer/shorter than self.pcd
+            # actually is — which doesn't fail here, but fails later at
+            # Continue when nonground_src_idx[obj_mask] gets boolean-indexed
+            # against the wrong length. Getting the inlier indices directly
+            # from segment_plane (same RANSAC pcg.remove_ground() uses
+            # internally) sidesteps the reconstruction step entirely, so the
+            # lengths are correct by construction — no matching, no rounding.
+            thresh = self.ground_thresh_var.get()
+            n_full = len(np.asarray(self.pcd_full.points))
+            try:
+                _, inliers = self.pcd_full.segment_plane(
+                    distance_threshold=thresh, ransac_n=3, num_iterations=1000)
+            except Exception:
+                inliers = []
+            ground_mask = np.zeros(n_full, dtype=bool)
+            if len(inliers) > 0:
+                ground_mask[np.asarray(inliers, dtype=np.int64)] = True
+
+            self.nonground_src_idx = np.where(~ground_mask)[0]
+            self.ground_src_idx = np.where(ground_mask)[0]
+            self.pcd = self.pcd_full.select_by_index(self.nonground_src_idx.tolist())
+            self.ground_pcd = self.pcd_full.select_by_index(self.ground_src_idx.tolist())
+            assert len(self.nonground_src_idx) == len(np.asarray(self.pcd.points)), \
+                "Ground-removal index bookkeeping is out of sync with pcd — " \
+                "this should be impossible now that indices come straight " \
+                "from segment_plane; please report this."
+            print(f"[ground] Removed {int(ground_mask.sum()):,} floor points "
+                  f"(threshold={thresh:.2f}).")
+        else:
+            self.pcd = self.pcd_full
+            self.nonground_src_idx = np.arange(len(np.asarray(self.pcd_full.points)))
+            self.ground_src_idx = np.array([], dtype=np.int64)
+            self.ground_pcd = o3d.geometry.PointCloud()
+            print("[ground] Ground removal disabled — floor stays part of the scene/clusters.")
+
+        eps = None if self.auto_eps_var.get() else float(self.eps_var.get())
+        min_pts = int(self.min_pts_var.get())
+        labels, n_clusters, eps_used = pcg.cluster_dbscan(self.pcd, eps=eps, min_pts=min_pts)
+        if self.auto_eps_var.get():
+            self.eps_var.set(round(eps_used, 4))
+
+        self.labels = labels
+        self.n_clusters = n_clusters
+        self.palette = pcg.make_palette(n_clusters)
+        self.cluster_meta = build_cluster_meta(self.pcd, labels, n_clusters)
+        self.removed_idx = set()   # stale against the new clustering — reset clean-up
+
+        print(f"[cluster] {n_clusters} clusters found (eps={eps_used:.4f}, "
+              f"min_points={min_pts}).")
+        self._populate_list()
+
+    def _populate_list(self):
         cids = sorted(self.cluster_meta, key=lambda c: -self.cluster_meta[c]["n_points"])
         self.clist.delete(0, "end")
         for cid in cids:
             m = self.cluster_meta[cid]
             self.clist.insert("end", f"{cid:>3}   {m['n_points']:>7,} pts")
         self._cids_sorted = cids
-        # Color each row to match its color in the labeled 3D overview.
         for i, cid in enumerate(cids):
             col = self.palette[cid]
             hexcol = "#{:02x}{:02x}{:02x}".format(
                 int(col[0]*200+55), int(col[1]*200+55), int(col[2]*200+55))
             self.clist.itemconfig(i, fg=hexcol)
-        self.status.config(text=f"{self.n_clusters} clusters. Select one, then Continue.")
+        self._update_status()
 
-        if self.preselect_cid is not None and self.preselect_cid in self._cids_sorted:
-            row = self._cids_sorted.index(self.preselect_cid)
-            self.clist.selection_clear(0, "end")
-            self.clist.selection_set(row)
-            self.clist.see(row)
-            self.selected_cid = self.preselect_cid
-            self.continue_btn.config(state="normal")
-            m = self.cluster_meta[self.preselect_cid]
-            self.status.config(
-                text=f"Pre-selected cluster {self.preselect_cid} from your click "
-                     f"({m['n_points']:,} pts). Ready, or pick a different one.")
-
-    def _on_select(self, _evt):
+    # ── selection helpers ────────────────────────────────────────────────
+    def _get_selected_cids(self):
         sel = self.clist.curselection()
-        if not sel:
-            return
-        self.selected_cid = self._cids_sorted[sel[0]]
-        self.continue_btn.config(state="normal")
-        m = self.cluster_meta[self.selected_cid]
-        self.status.config(text=f"Selected cluster {self.selected_cid} "
-                                 f"({m['n_points']:,} pts). Ready.")
+        return [self._cids_sorted[i] for i in sel]
 
+    def _selected_mask(self):
+        cids = self._get_selected_cids()
+        if self.labels is None:
+            return np.zeros(0, dtype=bool)
+        if not cids:
+            return np.zeros(len(self.labels), dtype=bool)
+        mask = np.isin(self.labels, cids)
+        if self.removed_idx:
+            mask[np.array(sorted(self.removed_idx), dtype=np.int64)] = False
+        return mask
+
+    def _update_status(self):
+        cids = self._get_selected_cids()
+        mask = self._selected_mask()
+        n = int(mask.sum())
+        removed_txt = f", {len(self.removed_idx):,} cleaned out" if self.removed_idx else ""
+        if cids:
+            self.status.config(text=f"{len(cids)} cluster(s) selected: {cids} → "
+                                     f"{n:,} pts{removed_txt}.")
+            self.continue_btn.config(state="normal" if n > 0 else "disabled")
+        else:
+            self.status.config(text=f"{self.n_clusters} clusters. Select one or "
+                                     f"more, then Continue.")
+            self.continue_btn.config(state="disabled")
+
+    # ── identify by click (unchanged old Step-0 window, now on-demand) ──────
+    def _on_identify_click(self):
+        cids = show_labeled_cluster_overview(
+            self.pcd, self.labels, self.n_clusters, self.palette, self.cluster_meta)
+        for cid in cids:
+            if cid in self._cids_sorted:
+                row = self._cids_sorted.index(cid)
+                self.clist.selection_set(row)
+                self.clist.see(row)
+        self._update_status()
+
+    # ── preview (shows exactly what you've selected, isolated) ──────────────
+    def _on_preview(self):
+        mask = self._selected_mask()
+        if not mask.any():
+            messagebox.showinfo("Preview", "Select at least one cluster first.")
+            return
+        pts = np.asarray(self.pcd.points)[mask]
+        cols = (np.asarray(self.pcd.colors)[mask] if self.pcd.has_colors()
+                else np.tile([0.9, 0.6, 0.15], (int(mask.sum()), 1)))
+        disp = o3d.geometry.PointCloud()
+        disp.points = o3d.utility.Vector3dVector(pts)
+        disp.colors = o3d.utility.Vector3dVector(cols)
+
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(
+            window_name=f"Preview — {int(mask.sum()):,} pts — close (Q/Esc) when done",
+            width=960, height=720)
+        vis.add_geometry(disp)
+        opt = vis.get_render_option()
+        opt.background_color = np.array([0.08, 0.08, 0.12])
+        opt.point_size = 2.5
+        opt.show_coordinate_frame = True
+        vis.run()
+        vis.destroy_window()
+
+    # ── clean-up tool (rectangle + lasso combo) ─────────────────────────────
+    def _on_cleanup(self):
+        mask = self._selected_mask()
+        if not mask.any():
+            messagebox.showinfo("Clean up", "Select at least one cluster first.")
+            return
+        global_idx = np.where(mask)[0]
+        pts = np.asarray(self.pcd.points)[global_idx]
+        cols = np.asarray(self.pcd.colors)[global_idx] if self.pcd.has_colors() else None
+
+        def on_done(removed_global_idx):
+            if len(removed_global_idx) > 0:
+                self.removed_idx.update(int(i) for i in removed_global_idx)
+            self._update_status()
+
+        CleanupTool(self.root, pts, cols, global_idx, on_done)
+
+    # ── continue ─────────────────────────────────────────────────────────
     def _continue(self):
-        if self.selected_cid is None:
+        obj_mask = self._selected_mask()
+        if not obj_mask.any():
             return
         self.root.destroy()
-        self.on_continue(self.pcd, self.labels, self.n_clusters, self.selected_cid)
+        self.on_continue_cb(self.pcd, self.labels, self.n_clusters, obj_mask,
+                             self.nonground_src_idx, self.ground_src_idx, self.ground_pcd)
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Step 2 — split room vs. object
 # ════════════════════════════════════════════════════════════════════════════
 
-def split_room_and_object(pcd, labels, cid):
+def split_room_and_object(pcd, labels, obj_mask):
     """Returns (room_pcd_without_object, object_pcd, obj_mask).
 
-    CHANGE 6: now also returns the boolean obj_mask. This is the same mask
-    used to slice `pcd`/`cols` here, so it can be reused, unmodified, to
-    slice SourceSplat's original scale/rot/opacity/f_dc/f_rest arrays —
-    the room/object split no longer needs a second, separate pass just to
-    figure out "which original point is this."
+    `obj_mask` is now taken directly as a boolean array over pcd's rows,
+    built by ClusteringWorkbench from the union of every cluster you
+    selected minus anything you removed with the clean-up tool — so this
+    naturally supports moving more than one cluster together as a single
+    object. `labels` is kept as a parameter for interface stability but is
+    no longer read here.
     """
     pts  = np.asarray(pcd.points)
     cols = np.asarray(pcd.colors) if pcd.has_colors() else np.ones_like(pts)
 
-    obj_mask  = labels == cid
+    obj_mask  = np.asarray(obj_mask, dtype=bool)
     room_mask = ~obj_mask
 
     room = o3d.geometry.PointCloud()
@@ -1719,52 +2080,43 @@ def main():
     src = SourceSplat(filepath)
     pcd_full = src.view_pcd()
 
-    # ── Ground removal disabled ─────────────────────────────────────────────
-    # pcg.remove_ground() is no longer called. The full scene (floor
-    # included) goes straight into clustering, so `pcd` is just `pcd_full`.
-    # Since nothing was removed, the "nonground" index mapping back into
-    # `src` is simply the identity (every row of pcd_full IS the
-    # corresponding row of src, in the same order), and there's no separate
-    # ground set left to carve out or merge back in later. ground_src_idx
-    # and ground_pcd are kept as empty/no-op values purely so the rest of
-    # the pipeline (room_src_idx concatenation, _merge_pcds call) doesn't
-    # need any other changes.
-    pcd = pcd_full
-    nonground_src_idx = np.arange(src.n)
-    ground_src_idx = np.array([], dtype=np.int64)
-    ground_pcd = o3d.geometry.PointCloud()
-    print("[ground] Ground removal is disabled — floor points remain part of the scene/clusters.")
+    # ── Clustering Workbench ────────────────────────────────────────────────
+    # Ground removal on/off + threshold, DBSCAN eps/min_points sliders,
+    # multi-cluster select, preview, and rectangle/lasso clean-up all live
+    # in this one interactive window now — see ClusteringWorkbench above.
+    # It owns pcd/labels/n_clusters/nonground_src_idx/ground_src_idx/
+    # ground_pcd internally (they can change every time you re-cluster or
+    # toggle ground removal), and hands the final versions back here via
+    # on_continue once you press Continue.
+    print("Opening clustering workbench — configure ground removal / DBSCAN, "
+          "select one or more clusters (multi-select supported), preview and "
+          "clean up if needed, then Continue.")
 
-    print("Clustering (DBSCAN) — this can take a while on huge scenes …")
-    labels, n_clusters, eps = pcg.cluster_dbscan(pcd)
-    palette = pcg.make_palette(n_clusters)
-    cluster_meta = build_cluster_meta(pcd, labels, n_clusters)
-    print(f"{n_clusters} clusters found (eps={eps:.4f}).")
-
-    print("Opening cluster identification window — shift+click on your "
-          "object's points, then press Q to close and continue.")
-    candidate_cids = show_labeled_cluster_overview(pcd, labels, n_clusters, palette, cluster_meta)
-    preselect_cid = candidate_cids[0] if candidate_cids else None
-
-    def on_continue(pcd, labels, n_clusters, cid):
-        room_pcd, obj_pcd, obj_mask = split_room_and_object(pcd, labels, cid)
+    def on_continue(pcd, labels, n_clusters, obj_mask,
+                     nonground_src_idx, ground_src_idx, ground_pcd):
+        room_pcd, obj_pcd, obj_mask = split_room_and_object(pcd, labels, obj_mask)
 
         # `nonground_src_idx` maps every row of `pcd` back to its row in
         # `src`. Slicing it by the same obj_mask/room_mask used to split
         # room vs. object gives the exact original indices for each half —
         # no re-matching, no re-fitting.
+        assert len(nonground_src_idx) == len(obj_mask), (
+            f"nonground_src_idx ({len(nonground_src_idx):,}) and obj_mask "
+            f"({len(obj_mask):,}) length mismatch — ground-removal index "
+            f"bookkeeping is out of sync with the clustered point cloud. "
+            f"Try 'Run clustering' again before Continue.")
         obj_src_idx  = nonground_src_idx[obj_mask]
         room_src_idx = np.concatenate(
             [nonground_src_idx[~obj_mask], ground_src_idx])
 
         # Merge the floor back into the room cloud so the VIEWER shows it
         # (this is display-only — export uses room_src_idx, not room_pcd,
-        # whenever src.has_splat_attrs). With ground removal disabled,
-        # ground_pcd is empty, so this is a no-op merge (room_pcd already
-        # contains the floor since it was never removed).
+        # whenever src.has_splat_attrs). If ground removal was left off in
+        # the workbench, ground_pcd is empty and this is a no-op merge
+        # (room_pcd already contains the floor since it was never removed).
         room_pcd = _merge_pcds(room_pcd, ground_pcd)
 
-        print(f"Object cluster {cid}: {len(obj_pcd.points):,} pts. "
+        print(f"Object selection: {len(obj_pcd.points):,} pts. "
               f"Room + floor: {len(room_pcd.points):,} pts.")
 
         # ── CHANGE 10: slice the object's ORIGINAL attributes here, before
@@ -1790,10 +2142,9 @@ def main():
         scene = CombinedScene(room_pcd, job, src=src, room_src_idx=room_src_idx)
         scene.run(light_gui=light_gui)
 
-    picker_root = tk.Tk()
-    ObjectPickerApp(picker_root, pcd, labels, n_clusters, palette, cluster_meta, on_continue,
-                    preselect_cid=preselect_cid)
-    picker_root.mainloop()
+    workbench_root = tk.Tk()
+    ClusteringWorkbench(workbench_root, pcd_full, on_continue)
+    workbench_root.mainloop()
 
 
 if __name__ == "__main__":
