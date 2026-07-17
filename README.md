@@ -1,4 +1,20 @@
 # Segmentation
+
+A set of tools for editing 3D scenes reconstructed as Gaussian Splats: taking a
+scanned room (as a splat/point cloud `.ply`), isolating an object inside it via
+clustering, and repositioning, relighting, or extracting that object as a
+standalone splat.
+
+The core entry point is `scene_composer.py`, which combines DBSCAN-based
+object selection with PCA Gaussian fitting and an interactive Open3D viewer for
+moving, rotating, and relighting the selected object before exporting the
+result as a standard 3DGS `.ply`. The other `scene_composer_*` scripts are
+earlier iterations of the same pipeline (different rendering backends), kept
+for reference — `scene_composer.py` is the one to use.
+
+See `3D-Gaussian-Splat-Scene-Editing-Pipeline.pdf` / `.pptx` for the design
+writeup behind this pipeline.
+
 # scene_composer.py
 
 Glue script that ties together a room/environment point cloud, DBSCAN
