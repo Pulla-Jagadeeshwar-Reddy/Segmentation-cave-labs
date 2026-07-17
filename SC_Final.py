@@ -1394,9 +1394,17 @@ def _merge_pcds(*pcds: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
 
 class CombinedScene:
     def __init__(self, room_pcd, job: SplatJob, src: "SourceSplat" = None,
-                 room_src_idx: np.ndarray = None):
+                 room_src_idx: np.ndarray = None, lighting_enabled: bool = True):
         self.room_pcd     = room_pcd
         self.job          = job
+
+        # ── CHANGE 20 — master lighting on/off switch ───────────────────────
+        # When False, _apply_occlusion_shading() becomes a no-op: it skips
+        # every KD-tree/ray-march computation and just leaves the object at
+        # its true (unshaded) colors, both in the viewer and on export.
+        # Toggle from the CLI with --no-light, or flip self.lighting_enabled
+        # directly / via the light panel's "Lighting enabled" checkbox.
+        self.lighting_enabled = lighting_enabled
         # CHANGE 8: carry the original SourceSplat + the room's indices into
         # it all the way to export time, so _export_gaussians/_export_object_only
         # can write the room back from ORIGINAL attributes instead of
@@ -1961,7 +1969,23 @@ class CombinedScene:
         CHANGE 18: dispatches on self.LIGHT_MODE — "point" uses the new
         in-room point light, "directional" uses the original sun-like
         light. Both keep working; the mode just picks which one is live.
+
+        CHANGE 20: if self.lighting_enabled is False, lighting is disabled
+        entirely — no KD-tree/ray-march work happens at all, the object is
+        left at its true (unshaded) obj_base_colors, and last_occlusion_darken
+        is reset to a neutral (all-1.0) array so export writes the same
+        untouched colors.
         """
+        if not self.lighting_enabled:
+            if self.obj_base_colors is not None:
+                self.last_occlusion_darken = np.ones(
+                    len(self.obj_base_colors), dtype=np.float64)
+                self.obj_geom.colors = o3d.utility.Vector3dVector(self.obj_base_colors)
+                self.vis.update_geometry(self.obj_geom)
+            print("[shading] Lighting is disabled — object left at its "
+                  "true (unshaded) colors.")
+            return False
+
         if self.LIGHT_MODE == "point":
             darken = self._compute_point_light_darken()
         else:
@@ -2397,6 +2421,10 @@ class CombinedScene:
     def run(self, light_gui=False):
         print("Room loaded. Splatting selected object in the background …")
         panel = None
+        if light_gui and not self.lighting_enabled:
+            print("[light] Lighting is disabled (--no-light) — the light "
+                  "control panel will not be opened.")
+            light_gui = False
         if light_gui:
             panel = self._build_light_panel()
             self.light_gizmo = None
@@ -2437,7 +2465,11 @@ def main():
     # viewer. Stripped out here so it doesn't get mistaken for the filepath
     # positional argument.
     light_gui = "--light-gui" in sys.argv
-    argv = [a for a in sys.argv if a != "--light-gui"]
+    # CHANGE 20: --no-light turns the whole lighting/shading system off —
+    # the object is exported/viewed at its true, unshaded colors, and no
+    # shadow KD-tree / ray-march work is ever done.
+    lighting_enabled = "--no-light" not in sys.argv
+    argv = [a for a in sys.argv if a not in ("--light-gui", "--no-light")]
 
     filepath = argv[1] if len(argv) > 1 else pick_file_dialog()
     if not filepath or not os.path.isfile(filepath):
@@ -2514,7 +2546,8 @@ def main():
         threading.Thread(target=job.run, args=(obj_pcd,), kwargs=dict(orig_attrs=orig_attrs),
                           daemon=True).start()
         # … while the room viewer opens and runs immediately.
-        scene = CombinedScene(room_pcd, job, src=src, room_src_idx=room_src_idx)
+        scene = CombinedScene(room_pcd, job, src=src, room_src_idx=room_src_idx,
+                               lighting_enabled=lighting_enabled)
         scene.run(light_gui=light_gui)
 
     workbench_root = tk.Tk()

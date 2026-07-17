@@ -153,6 +153,8 @@ def _ensure(pkg):
 _ensure("scipy")
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
 
 _ensure("plyfile")
 from plyfile import PlyData, PlyElement
@@ -813,6 +815,209 @@ def split_room_and_object(pcd, labels, obj_mask):
     return room, obj, obj_mask
 
 
+# ── Hole-fill / "hallucination" — cover the gap left behind by the object ───
+def _fit_local_plane(rim_pts, rim_cols, dist_thresh):
+    """RANSAC-fits a plane to `rim_pts`. Returns (normal, u_axis, v_axis,
+    plane_point, plane_pts, plane_cols) or None if it can't find one."""
+    rim_pcd = o3d.geometry.PointCloud()
+    rim_pcd.points = o3d.utility.Vector3dVector(rim_pts)
+    try:
+        plane_model, inlier_idx = rim_pcd.segment_plane(
+            distance_threshold=dist_thresh, ransac_n=3, num_iterations=500)
+    except Exception:
+        return None
+    if len(inlier_idx) < 8:
+        return None
+
+    normal = np.array(plane_model[:3], dtype=np.float64)
+    n_norm = np.linalg.norm(normal)
+    if n_norm < 1e-9:
+        return None
+    normal /= n_norm
+
+    helper = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(helper, normal)) > 0.98:
+        helper = np.array([1.0, 0.0, 0.0])
+    u_axis = np.cross(helper, normal); u_axis /= np.linalg.norm(u_axis)
+    v_axis = np.cross(normal, u_axis)
+
+    plane_pts, plane_cols = rim_pts[inlier_idx], rim_cols[inlier_idx]
+    plane_point = plane_pts.mean(axis=0)
+    return normal, u_axis, v_axis, plane_point, plane_pts, plane_cols
+
+
+def _fill_hole_for_component(comp_pts, room_pts, room_cols,
+                              pad_frac=1.5, max_fill_points=20_000,
+                              max_span_ratio=6.0, max_grid_side=350):
+    """Hallucinates fill points for ONE compact, connected chunk of the
+    removed object. Returns (fill_pts, fill_cols) or (None, None) if this
+    component isn't a good candidate to fill (too small, no nearby flat
+    surface, or not flat enough to have a sensible "footprint")."""
+    obj_min, obj_max = comp_pts.min(axis=0), comp_pts.max(axis=0)
+    center = (obj_min + obj_max) / 2.0
+    half_extent = np.maximum((obj_max - obj_min) / 2.0, 1e-4)
+    diag = float(np.linalg.norm(half_extent)) * 2.0
+
+    pad_half = half_extent * pad_frac
+    lo, hi = center - pad_half, center + pad_half
+    in_box = np.all((room_pts >= lo) & (room_pts <= hi), axis=1)
+    rim_pts, rim_cols = room_pts[in_box], room_cols[in_box]
+    if len(rim_pts) < 12:
+        return None, None  # not enough local context to hallucinate anything
+
+    dist_thresh = max(diag * 0.02, 1e-4)
+    fit = _fit_local_plane(rim_pts, rim_cols, dist_thresh)
+    if fit is None:
+        return None, None
+    normal, u_axis, v_axis, plane_point, plane_pts, plane_cols = fit
+
+    # Sanity check: this component's OWN points must actually sit roughly
+    # flat against the fitted plane (i.e. it looks like something resting
+    # on/against a surface). A chunky, fully-3D object (a bag, a chair,
+    # anything with real depth off the surface) does NOT have a single
+    # well-defined "footprint plane" — forcing one produces a huge,
+    # wrong-looking patch. Skip those and leave the (smaller, honest) gap
+    # rather than hallucinate something worse.
+    comp_dist_to_plane = np.abs((comp_pts - plane_point) @ normal)
+    if float(np.median(comp_dist_to_plane)) > diag * 0.35:
+        return None, None
+
+    tree_rim = cKDTree(rim_pts)
+    nn_d, _ = tree_rim.query(rim_pts, k=min(4, len(rim_pts)))
+    nn_d = np.atleast_2d(nn_d)
+    spacing = float(np.median(nn_d[:, 1:])) if nn_d.shape[1] > 1 else diag * 0.02
+    spacing = max(spacing, diag * 0.005, 1e-5)
+
+    obj_uv = np.stack([(comp_pts - plane_point) @ u_axis,
+                        (comp_pts - plane_point) @ v_axis], axis=1)
+    margin = spacing * 1.5
+    u_lo, v_lo = obj_uv.min(axis=0) - margin
+    u_hi, v_hi = obj_uv.max(axis=0) + margin
+
+    # Sanity check: the footprint span shouldn't dwarf the component's own
+    # bounding diagonal — if it does, spacing/plane estimation went wrong
+    # somewhere upstream. Bail out safely instead of tiling a huge grid.
+    span = max(u_hi - u_lo, v_hi - v_lo)
+    if span > diag * max_span_ratio:
+        return None, None
+
+    n_u = min(max(int((u_hi - u_lo) / spacing), 1) + 1, max_grid_side)
+    n_v = min(max(int((v_hi - v_lo) / spacing), 1) + 1, max_grid_side)
+    if n_u * n_v > max_fill_points:
+        return None, None
+
+    uu, vv = np.meshgrid(np.linspace(u_lo, u_hi, n_u), np.linspace(v_lo, v_hi, n_v))
+    grid_uv = np.stack([uu.ravel(), vv.ravel()], axis=1)
+
+    tree_obj_uv = cKDTree(obj_uv)
+    near_d, _ = tree_obj_uv.query(grid_uv, k=1)
+    grid_uv = grid_uv[near_d <= spacing * 1.2]
+    if len(grid_uv) == 0:
+        return None, None
+
+    fill_pts = (plane_point[None, :]
+                + grid_uv[:, 0:1] * u_axis[None, :]
+                + grid_uv[:, 1:2] * v_axis[None, :])
+
+    room_tree = cKDTree(room_pts)
+    d_to_room, _ = room_tree.query(fill_pts, k=1)
+    fill_pts = fill_pts[d_to_room > spacing * 0.6]
+    if len(fill_pts) == 0:
+        return None, None
+
+    rim_color_tree = cKDTree(plane_pts)
+    _, nn_idx = rim_color_tree.query(fill_pts, k=1)
+    fill_cols = plane_cols[nn_idx]
+    return fill_pts, fill_cols
+
+
+def fill_object_hole(room_pcd, obj_pcd, pad_frac=1.5, comp_radius_factor=3.0,
+                      min_component_pts=20, max_fill_per_component=20_000):
+    """
+    Once the object's points are removed by split_room_and_object(), the
+    room point cloud has a literal hole where it used to sit. Since the
+    object is about to become movable, that hole would stay empty and
+    visible even after the object has moved away. We never scanned what's
+    actually behind the object, so there's no ground truth to restore —
+    instead this HALLUCINATES plausible filler geometry, one connected
+    piece of the removed object at a time:
+
+      1. Split the removed object into connected components — a
+         multi-cluster selection (e.g. two separate items picked
+         together) is NOT one giant combined blob; treating it as one
+         used to pull in a huge, irrelevant "rim" of room context
+         spanning both, fit a single plane across all of it, and tile a
+         room-spanning grid of points across that plane — visible as a
+         big diagonal grid of hallucinated points, worse than the
+         original hole. Splitting keeps each fill local and compact.
+      2. For each component, look at the real room points immediately
+         around it (the "rim") and fit the dominant local surface
+         (wall/floor/table) via RANSAC.
+      3. Only fill components that actually sit roughly flat against
+         that surface — a chunky, fully-3D object has no single
+         "footprint plane", and forcing one is exactly what produced the
+         oversized, blurry-looking patch. Those are left as an honest,
+         smaller gap instead.
+      4. Tile synthetic points across the flat component's footprint on
+         that plane, matched to the room's own local point spacing, and
+         color each from its nearest real rim point.
+
+    Returns a NEW point cloud (room_pcd + synthetic fill points), or
+    room_pcd unchanged if nothing was safe to fill.
+    """
+    obj_pts_all = np.asarray(obj_pcd.points)
+    room_pts = np.asarray(room_pcd.points)
+    if len(obj_pts_all) == 0 or len(room_pts) < 20:
+        return room_pcd
+    room_cols = (np.asarray(room_pcd.colors) if room_pcd.has_colors()
+                 else np.ones_like(room_pts))
+
+    n_obj = len(obj_pts_all)
+    obj_tree = cKDTree(obj_pts_all)
+    nn_d, _ = obj_tree.query(obj_pts_all, k=min(4, n_obj))
+    nn_d = np.atleast_2d(nn_d)
+    obj_spacing = float(np.median(nn_d[:, 1:])) if nn_d.shape[1] > 1 else 0.01
+    obj_spacing = max(obj_spacing, 1e-5)
+    link_radius = obj_spacing * comp_radius_factor
+
+    pairs = obj_tree.query_pairs(r=link_radius, output_type="ndarray")
+    if len(pairs) > 0:
+        graph = sp.coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                               shape=(n_obj, n_obj))
+        n_comp, comp_labels = connected_components(graph, directed=False)
+    else:
+        n_comp, comp_labels = n_obj, np.arange(n_obj)
+
+    all_fill_pts, all_fill_cols, n_filled_components = [], [], 0
+    for cid in range(n_comp):
+        comp_mask = comp_labels == cid
+        if np.count_nonzero(comp_mask) < min_component_pts:
+            continue
+        fill_pts, fill_cols = _fill_hole_for_component(
+            obj_pts_all[comp_mask], room_pts, room_cols,
+            pad_frac=pad_frac, max_fill_points=max_fill_per_component)
+        if fill_pts is not None and len(fill_pts) > 0:
+            all_fill_pts.append(fill_pts)
+            all_fill_cols.append(fill_cols)
+            n_filled_components += 1
+
+    if not all_fill_pts:
+        print("[hole-fill] Nothing safe to hallucinate (object wasn't resting "
+              "flat against a nearby surface, or there wasn't enough "
+              "surrounding context) — leaving the gap as-is.")
+        return room_pcd
+
+    fill_pts = np.vstack(all_fill_pts)
+    fill_cols = np.vstack(all_fill_cols)
+    filled = o3d.geometry.PointCloud()
+    filled.points = o3d.utility.Vector3dVector(np.vstack([room_pts, fill_pts]))
+    filled.colors = o3d.utility.Vector3dVector(np.vstack([room_cols, fill_cols]))
+    print(f"[hole-fill] Hallucinated {len(fill_pts):,} points across "
+          f"{n_filled_components} component(s) to help cover the object's "
+          f"footprint once it moves.")
+    return filled
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Step 3 — background Gaussian-splat fitting (runs in parallel with the room
 #           viewer opening) and conversion into a movable "splat proxy"
@@ -1435,30 +1640,30 @@ class CombinedScene:
         # search naturally tolerates sparse/uneven point density, since it
         # finds whatever real points are nearby instead of relying on them
         # landing in one exact cell.
-        self.LIGHT_AZIMUTH_DEG    = 40.0   # compass angle of the light around +Z (0 = +X)
-        self.LIGHT_ELEVATION_DEG  = 55.0   # angle above the horizon (90 = straight down)
-        self.SHADOW_RADIUS_FRAC   = 0.02   # width (fraction of room scale) of the
+        # [LIGHTING DISABLED] self.LIGHT_AZIMUTH_DEG    = 40.0   # compass angle of the light around +Z (0 = +X)
+        # [LIGHTING DISABLED] self.LIGHT_ELEVATION_DEG  = 55.0   # angle above the horizon (90 = straight down)
+        # [LIGHTING DISABLED] self.SHADOW_RADIUS_FRAC   = 0.02   # width (fraction of room scale) of the
                                             # light-space column searched around each point
-        self.SHADOW_BIAS_FRAC     = 0.004  # depth bias (fraction of room scale) so a point
+        # [LIGHTING DISABLED] self.SHADOW_BIAS_FRAC     = 0.004  # depth bias (fraction of room scale) so a point
                                             # doesn't "shadow itself" from float noise
-        self.SHADOW_SATURATE_COUNT = 12    # occluding-neighbor count that = full shadow
-        self.SHADOW_STRENGTH      = 0.65   # max darkening in full shadow (0=no effect, 1=black)
-        self.ENABLE_SELF_SHADOW   = False  # CHANGE 16: object shadowing its OWN points is
+        # [LIGHTING DISABLED] self.SHADOW_SATURATE_COUNT = 12    # occluding-neighbor count that = full shadow
+        # [LIGHTING DISABLED] self.SHADOW_STRENGTH      = 0.65   # max darkening in full shadow (0=no effect, 1=black)
+        # [LIGHTING DISABLED] self.ENABLE_SELF_SHADOW   = False  # CHANGE 16: object shadowing its OWN points is
                                             # OFF by default — see _compute_directional_darken
                                             # docstring. Bushy/cluttered objects (foliage, a
                                             # vase of flowers) saturate almost instantly and
                                             # end up darkened everywhere regardless of light
                                             # direction. Only enable for solid, simple,
                                             # genuinely concave objects.
-        self.SELF_SHADOW_RADIUS_FRAC = 0.05  # fraction of the OBJECT's own size (not the
+        # [LIGHTING DISABLED] self.SELF_SHADOW_RADIUS_FRAC = 0.05  # fraction of the OBJECT's own size (not the
                                               # room's) — only used if ENABLE_SELF_SHADOW
-        self.SELF_SHADOW_BIAS_FRAC   = 0.02  # fraction of the OBJECT's own size
-        self.light_dir = None
-        self.u_axis = None
-        self.v_axis = None
-        self.room_shadow_tree = None   # cKDTree over room points' (u, v) light-space coords
-        self.room_light_depth = None   # matching light-space depth, one per room point
-        self.last_occlusion_darken = None  # CHANGE 12: cached per-point darken
+        # [LIGHTING DISABLED] self.SELF_SHADOW_BIAS_FRAC   = 0.02  # fraction of the OBJECT's own size
+        # [LIGHTING DISABLED] self.light_dir = None
+        # [LIGHTING DISABLED] self.u_axis = None
+        # [LIGHTING DISABLED] self.v_axis = None
+        # [LIGHTING DISABLED] self.room_shadow_tree = None   # cKDTree over room points' (u, v) light-space coords
+        # [LIGHTING DISABLED] self.room_light_depth = None   # matching light-space depth, one per room point
+        # [LIGHTING DISABLED] self.last_occlusion_darken = None  # CHANGE 12: cached per-point darken
                                             # array from the most recent shading
                                             # pass, reused at export time so the
                                             # exported .ply matches the viewer.
@@ -1473,25 +1678,25 @@ class CombinedScene:
         # stay fully wired up; LIGHT_MODE just picks which one drives the
         # shading/gizmo at any given moment — see _apply_occlusion_shading,
         # build_light_gizmo, and the panel's mode toggle.
-        self.LIGHT_MODE = "point"      # "point" (new, inside the room) or
+        # [LIGHTING DISABLED] self.LIGHT_MODE = "point"      # "point" (new, inside the room) or
                                         # "directional" (old, sun-like)
-        self.light_pos = None          # world-space (x, y, z) of the bulb —
+        # [LIGHTING DISABLED] self.light_pos = None          # world-space (x, y, z) of the bulb —
                                         # set by _init_light_pos() below
-        self.LIGHT_POS_MIN = None      # the light is clamped to stay inside
-        self.LIGHT_POS_MAX = None      # these bounds — a small inset of the
+        # [LIGHTING DISABLED] self.LIGHT_POS_MIN = None      # the light is clamped to stay inside
+        # [LIGHTING DISABLED] self.LIGHT_POS_MAX = None      # these bounds — a small inset of the
                                         # room's own bbox, so it can be moved
                                         # anywhere in the room but never
                                         # dragged out through a wall/ceiling
-        self.POINT_SHADOW_RADIUS_FRAC = 0.02  # same idea as SHADOW_RADIUS_FRAC,
+        # [LIGHTING DISABLED] self.POINT_SHADOW_RADIUS_FRAC = 0.02  # same idea as SHADOW_RADIUS_FRAC,
                                                # but for the point-light ray march
-        self.POINT_SHADOW_BIAS_FRAC   = 0.08  # fraction of EACH ray's own
+        # [LIGHTING DISABLED] self.POINT_SHADOW_BIAS_FRAC   = 0.08  # fraction of EACH ray's own
                                                # length left unsampled at both
                                                # ends, so neither the object
                                                # point nor the bulb itself
                                                # trips its own occluder test
-        self.POINT_SHADOW_SAMPLES     = 10    # samples marched along each
+        # [LIGHTING DISABLED] self.POINT_SHADOW_SAMPLES     = 10    # samples marched along each
                                                # object-point → bulb ray
-        self.ENABLE_DISTANCE_FALLOFF  = True  # point lights get dimmer with
+        # [LIGHTING DISABLED] self.ENABLE_DISTANCE_FALLOFF  = True  # point lights get dimmer with
                                                # distance (inverse-square,
                                                # referenced to half the room's
                                                # diagonal so mid-room stays
@@ -1499,18 +1704,18 @@ class CombinedScene:
                                                # light has no equivalent of
                                                # this, since it's infinitely
                                                # far away from every point
-        self.room_kdtree_3d = None     # cKDTree over raw room XYZ (world
+        # [LIGHTING DISABLED] self.room_kdtree_3d = None     # cKDTree over raw room XYZ (world
                                         # space) — built once; used by the
                                         # point-light ray march instead of
                                         # the light-space projected tree
                                         # above (which only makes sense for
                                         # one shared, fixed direction)
 
-        self.room_scale = float(np.linalg.norm(
-            self.room_pcd.get_axis_aligned_bounding_box().get_extent()))
-        self._init_light_pos()
-        self._build_light_basis()
-        self._build_shadow_tree()
+        # [LIGHTING DISABLED] self.room_scale = float(np.linalg.norm(
+            # [LIGHTING DISABLED] self.room_pcd.get_axis_aligned_bounding_box().get_extent()))
+        # [LIGHTING DISABLED] self._init_light_pos()
+        # [LIGHTING DISABLED] self._build_light_basis()
+        # [LIGHTING DISABLED] self._build_shadow_tree()
 
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(window_name="Scene — room + movable splat object",
@@ -1525,98 +1730,98 @@ class CombinedScene:
         self._register_keys()
 
     # ── CHANGE 18 — where the point light starts, and how far it can roam ──
-    def _init_light_pos(self):
-        """
-        Default point-light position: centered over the room in X/Y and up
-        near the ceiling in Z — roughly where a real room light/lamp would
-        hang — INSIDE the room's own bounding box, not outside it like the
-        old directional "sun". Also records LIGHT_POS_MIN/MAX, a small
-        inset of the room's bbox, so the light can be dragged anywhere
-        inside the room (via sliders or A/D/S/W/F/V) but never pushed out
-        through a wall, floor, or ceiling.
-        """
-        bbox = self.room_pcd.get_axis_aligned_bounding_box()
-        lo, hi = np.asarray(bbox.min_bound), np.asarray(bbox.max_bound)
-        margin = (hi - lo) * 0.05          # keep the light a bit clear of the walls
-        self.LIGHT_POS_MIN = lo + margin
-        self.LIGHT_POS_MAX = hi - margin
-        center_xy = (lo[:2] + hi[:2]) / 2.0
-        ceiling_z = hi[2] - (hi[2] - lo[2]) * 0.15   # ~85% of the way up
-        pos = np.array([center_xy[0], center_xy[1], ceiling_z])
-        self.light_pos = np.clip(pos, self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
+    # [LIGHTING DISABLED] def _init_light_pos(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Default point-light position: centered over the room in X/Y and up
+        # [LIGHTING DISABLED] near the ceiling in Z — roughly where a real room light/lamp would
+        # [LIGHTING DISABLED] hang — INSIDE the room's own bounding box, not outside it like the
+        # [LIGHTING DISABLED] old directional "sun". Also records LIGHT_POS_MIN/MAX, a small
+        # [LIGHTING DISABLED] inset of the room's bbox, so the light can be dragged anywhere
+        # [LIGHTING DISABLED] inside the room (via sliders or A/D/S/W/F/V) but never pushed out
+        # [LIGHTING DISABLED] through a wall, floor, or ceiling.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] bbox = self.room_pcd.get_axis_aligned_bounding_box()
+        # [LIGHTING DISABLED] lo, hi = np.asarray(bbox.min_bound), np.asarray(bbox.max_bound)
+        # [LIGHTING DISABLED] margin = (hi - lo) * 0.05          # keep the light a bit clear of the walls
+        # [LIGHTING DISABLED] self.LIGHT_POS_MIN = lo + margin
+        # [LIGHTING DISABLED] self.LIGHT_POS_MAX = hi - margin
+        # [LIGHTING DISABLED] center_xy = (lo[:2] + hi[:2]) / 2.0
+        # [LIGHTING DISABLED] ceiling_z = hi[2] - (hi[2] - lo[2]) * 0.15   # ~85% of the way up
+        # [LIGHTING DISABLED] pos = np.array([center_xy[0], center_xy[1], ceiling_z])
+        # [LIGHTING DISABLED] self.light_pos = np.clip(pos, self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
 
-    def move_light(self, delta):
-        """Nudge the point light by `delta` (world-space, meters), clamped
-        to stay inside LIGHT_POS_MIN/MAX."""
-        self.light_pos = np.clip(self.light_pos + np.asarray(delta, dtype=np.float64),
-                                  self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
+    # [LIGHTING DISABLED] def move_light(self, delta):
+        # [LIGHTING DISABLED] """Nudge the point light by `delta` (world-space, meters), clamped
+        # [LIGHTING DISABLED] to stay inside LIGHT_POS_MIN/MAX."""
+        # [LIGHTING DISABLED] self.light_pos = np.clip(self.light_pos + np.asarray(delta, dtype=np.float64),
+                                  # [LIGHTING DISABLED] self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
 
     # ── CHANGE 14 — light-space basis, built once (the light never moves) ──
-    def _build_light_basis(self):
-        """
-        Builds an orthonormal "light-space" frame: light_dir is the
-        direction the light TRAVELS (light source → scene), and
-        (u_axis, v_axis) span the plane perpendicular to it — exactly like
-        setting up a camera that looks straight down the light direction.
-        Everything downstream (the shadow map, and every per-point depth
-        test) works in this frame, which is what makes the result an
-        actual DIRECTIONAL shadow instead of an omnidirectional "stuff
-        nearby in XY" count.
+    # [LIGHTING DISABLED] def _build_light_basis(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Builds an orthonormal "light-space" frame: light_dir is the
+        # [LIGHTING DISABLED] direction the light TRAVELS (light source → scene), and
+        # [LIGHTING DISABLED] (u_axis, v_axis) span the plane perpendicular to it — exactly like
+        # [LIGHTING DISABLED] setting up a camera that looks straight down the light direction.
+        # [LIGHTING DISABLED] Everything downstream (the shadow map, and every per-point depth
+        # [LIGHTING DISABLED] test) works in this frame, which is what makes the result an
+        # [LIGHTING DISABLED] actual DIRECTIONAL shadow instead of an omnidirectional "stuff
+        # [LIGHTING DISABLED] nearby in XY" count.
 
-        Z is up in this pipeline (see colorize_by_height / remove_ground).
-        LIGHT_ELEVATION_DEG is measured up from the horizon, so 90° is a
-        straight-down light and 0° is a raking, near-horizontal light.
-        LIGHT_AZIMUTH_DEG rotates that around +Z, 0° pointing along +X.
-        """
-        az = np.radians(self.LIGHT_AZIMUTH_DEG)
-        el = np.radians(self.LIGHT_ELEVATION_DEG)
-        d = np.array([
-            np.cos(el) * np.cos(az),
-            np.cos(el) * np.sin(az),
-            -np.sin(el),          # positive elevation tilts the ray downward
-        ])
-        self.light_dir = d / np.linalg.norm(d)
+        # [LIGHTING DISABLED] Z is up in this pipeline (see colorize_by_height / remove_ground).
+        # [LIGHTING DISABLED] LIGHT_ELEVATION_DEG is measured up from the horizon, so 90° is a
+        # [LIGHTING DISABLED] straight-down light and 0° is a raking, near-horizontal light.
+        # [LIGHTING DISABLED] LIGHT_AZIMUTH_DEG rotates that around +Z, 0° pointing along +X.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] az = np.radians(self.LIGHT_AZIMUTH_DEG)
+        # [LIGHTING DISABLED] el = np.radians(self.LIGHT_ELEVATION_DEG)
+        # [LIGHTING DISABLED] d = np.array([
+            # [LIGHTING DISABLED] np.cos(el) * np.cos(az),
+            # [LIGHTING DISABLED] np.cos(el) * np.sin(az),
+            # [LIGHTING DISABLED] -np.sin(el),          # positive elevation tilts the ray downward
+        # [LIGHTING DISABLED] ])
+        # [LIGHTING DISABLED] self.light_dir = d / np.linalg.norm(d)
 
         # Any vector not parallel to light_dir gives one in-plane axis via
         # Gram-Schmidt; the second in-plane axis is just the cross product.
-        helper = np.array([0.0, 0.0, 1.0])
-        if abs(np.dot(helper, self.light_dir)) > 0.99:
-            helper = np.array([1.0, 0.0, 0.0])
-        u = np.cross(helper, self.light_dir)
-        self.u_axis = u / np.linalg.norm(u)
-        self.v_axis = np.cross(self.light_dir, self.u_axis)
+        # [LIGHTING DISABLED] helper = np.array([0.0, 0.0, 1.0])
+        # [LIGHTING DISABLED] if abs(np.dot(helper, self.light_dir)) > 0.99:
+            # [LIGHTING DISABLED] helper = np.array([1.0, 0.0, 0.0])
+        # [LIGHTING DISABLED] u = np.cross(helper, self.light_dir)
+        # [LIGHTING DISABLED] self.u_axis = u / np.linalg.norm(u)
+        # [LIGHTING DISABLED] self.v_axis = np.cross(self.light_dir, self.u_axis)
 
-    def _to_light_space(self, pts: np.ndarray):
-        """u, v = position across the light's view; depth = distance along
-        the light ray (SMALLER depth = CLOSER to the light source)."""
-        u = pts @ self.u_axis
-        v = pts @ self.v_axis
-        depth = pts @ self.light_dir
-        return u, v, depth
+    # [LIGHTING DISABLED] def _to_light_space(self, pts: np.ndarray):
+        # [LIGHTING DISABLED] """u, v = position across the light's view; depth = distance along
+        # [LIGHTING DISABLED] the light ray (SMALLER depth = CLOSER to the light source)."""
+        # [LIGHTING DISABLED] u = pts @ self.u_axis
+        # [LIGHTING DISABLED] v = pts @ self.v_axis
+        # [LIGHTING DISABLED] depth = pts @ self.light_dir
+        # [LIGHTING DISABLED] return u, v, depth
 
-    @staticmethod
-    def _light_uv(u, v):
-        return np.stack([u, v], axis=1)
+    # [LIGHTING DISABLED] @staticmethod
+    # [LIGHTING DISABLED] def _light_uv(u, v):
+        # [LIGHTING DISABLED] return np.stack([u, v], axis=1)
 
-    def _build_shadow_tree(self):
-        """
-        Builds the STATIC part of the directional shadow test from the
-        room alone: every room point's light-space (u, v) position goes
-        into a KD-tree, and its light-space depth is kept alongside it.
-        Built once in __init__ since the room is never edited or moved in
-        this tool — every later shading pass reuses this tree and only
-        has to project/query the small, currently-moving object cloud
-        against it.
-        """
-        pts = np.asarray(self.room_pcd.points)
-        if len(pts) == 0:
-            self.room_shadow_tree = None
-            self.room_light_depth = None
-            self.room_kdtree_3d = None
-            return
-        u, v, depth = self._to_light_space(pts)
-        self.room_light_depth = depth
-        self.room_shadow_tree = cKDTree(self._light_uv(u, v))
+    # [LIGHTING DISABLED] def _build_shadow_tree(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Builds the STATIC part of the directional shadow test from the
+        # [LIGHTING DISABLED] room alone: every room point's light-space (u, v) position goes
+        # [LIGHTING DISABLED] into a KD-tree, and its light-space depth is kept alongside it.
+        # [LIGHTING DISABLED] Built once in __init__ since the room is never edited or moved in
+        # [LIGHTING DISABLED] this tool — every later shading pass reuses this tree and only
+        # [LIGHTING DISABLED] has to project/query the small, currently-moving object cloud
+        # [LIGHTING DISABLED] against it.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] pts = np.asarray(self.room_pcd.points)
+        # [LIGHTING DISABLED] if len(pts) == 0:
+            # [LIGHTING DISABLED] self.room_shadow_tree = None
+            # [LIGHTING DISABLED] self.room_light_depth = None
+            # [LIGHTING DISABLED] self.room_kdtree_3d = None
+            # [LIGHTING DISABLED] return
+        # [LIGHTING DISABLED] u, v, depth = self._to_light_space(pts)
+        # [LIGHTING DISABLED] self.room_light_depth = depth
+        # [LIGHTING DISABLED] self.room_shadow_tree = cKDTree(self._light_uv(u, v))
 
         # CHANGE 18 — a plain, un-projected 3D tree of the same room points.
         # The directional tree above only works because every shadow ray in
@@ -1625,362 +1830,362 @@ class CombinedScene:
         # position instead, so each object point needs its OWN ray tested —
         # see _compute_point_light_darken, which queries this tree directly
         # in world space at several samples along each ray.
-        self.room_kdtree_3d = cKDTree(pts)
+        # [LIGHTING DISABLED] self.room_kdtree_3d = cKDTree(pts)
 
     # ── CHANGE 17 — recover the light direction FROM the room's own shading ─
-    def estimate_light_from_scene(self):
-        """
-        Looks at the ROOM's existing point colors and surface normals and
-        solves for the single directional light that best explains the
-        brightness pattern already baked into the scan — so instead of
-        guessing azimuth/elevation by hand, you get a starting point
-        derived from the actual photo/scan.
+    # [LIGHTING DISABLED] def estimate_light_from_scene(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Looks at the ROOM's existing point colors and surface normals and
+        # [LIGHTING DISABLED] solves for the single directional light that best explains the
+        # [LIGHTING DISABLED] brightness pattern already baked into the scan — so instead of
+        # [LIGHTING DISABLED] guessing azimuth/elevation by hand, you get a starting point
+        # [LIGHTING DISABLED] derived from the actual photo/scan.
 
-        Physics: under simple Lambertian shading, a surface's brightness
-        is proportional to how directly it faces the light —
-            brightness ≈ albedo * max(0, normal · direction_to_light) + ambient
-        Assuming roughly uniform albedo across the room (a real, if
-        imperfect, simplification — see caveat below), that becomes a
-        linear model in the normal components, solvable by least squares:
-            luminance_i ≈ normal_i · L + c
-        Solving for L over every room point recovers the direction the
-        room is, on average, "facing toward the light."
+        # [LIGHTING DISABLED] Physics: under simple Lambertian shading, a surface's brightness
+        # [LIGHTING DISABLED] is proportional to how directly it faces the light —
+            # [LIGHTING DISABLED] brightness ≈ albedo * max(0, normal · direction_to_light) + ambient
+        # [LIGHTING DISABLED] Assuming roughly uniform albedo across the room (a real, if
+        # [LIGHTING DISABLED] imperfect, simplification — see caveat below), that becomes a
+        # [LIGHTING DISABLED] linear model in the normal components, solvable by least squares:
+            # [LIGHTING DISABLED] luminance_i ≈ normal_i · L + c
+        # [LIGHTING DISABLED] Solving for L over every room point recovers the direction the
+        # [LIGHTING DISABLED] room is, on average, "facing toward the light."
 
-        Two passes are used because a plain one-shot fit is measurably
-        biased (verified on synthetic data: azimuth came out ~1° off,
-        elevation ~12° off, i.e. systematically UNDER-estimating how
-        steep the light is): points near their own shadow terminator
-        (grazing or self-shadowed, where the real max(0, ...) clip is
-        active) don't fit the plain linear model and pull the fit toward
-        a shallower elevation. So pass 1 gets a rough direction, then
-        pass 2 refits using only the brighter, clearly front-lit 40% of
-        points (by pass-1 alignment) — which removed that bias entirely
-        in testing (recovered a known 115°/35° light to within 0.1°).
+        # [LIGHTING DISABLED] Two passes are used because a plain one-shot fit is measurably
+        # [LIGHTING DISABLED] biased (verified on synthetic data: azimuth came out ~1° off,
+        # [LIGHTING DISABLED] elevation ~12° off, i.e. systematically UNDER-estimating how
+        # [LIGHTING DISABLED] steep the light is): points near their own shadow terminator
+        # [LIGHTING DISABLED] (grazing or self-shadowed, where the real max(0, ...) clip is
+        # [LIGHTING DISABLED] active) don't fit the plain linear model and pull the fit toward
+        # [LIGHTING DISABLED] a shallower elevation. So pass 1 gets a rough direction, then
+        # [LIGHTING DISABLED] pass 2 refits using only the brighter, clearly front-lit 40% of
+        # [LIGHTING DISABLED] points (by pass-1 alignment) — which removed that bias entirely
+        # [LIGHTING DISABLED] in testing (recovered a known 115°/35° light to within 0.1°).
 
-        Caveat: this assumes roughly uniform surface albedo. A room with
-        very different materials (dark wood table, pale walls, a bright
-        rug) will bias the result somewhat, same as any single-shot
-        shape-from-shading approach — treat this as a strong starting
-        point to fine-tune with the sliders, not a lab measurement.
+        # [LIGHTING DISABLED] Caveat: this assumes roughly uniform surface albedo. A room with
+        # [LIGHTING DISABLED] very different materials (dark wood table, pale walls, a bright
+        # [LIGHTING DISABLED] rug) will bias the result somewhat, same as any single-shot
+        # [LIGHTING DISABLED] shape-from-shading approach — treat this as a strong starting
+        # [LIGHTING DISABLED] point to fine-tune with the sliders, not a lab measurement.
 
-        Sets self.LIGHT_AZIMUTH_DEG / self.LIGHT_ELEVATION_DEG, rebuilds
-        the light basis + shadow tree, and returns (azimuth, elevation)
-        so a caller (e.g. the GUI) can sync slider positions to match.
-        Returns None if the room has no colors to estimate from.
-        """
-        pts = np.asarray(self.room_pcd.points)
-        if not self.room_pcd.has_colors() or len(pts) < 200:
-            print("[light] Room has no usable colors/points to estimate from.")
-            return None
+        # [LIGHTING DISABLED] Sets self.LIGHT_AZIMUTH_DEG / self.LIGHT_ELEVATION_DEG, rebuilds
+        # [LIGHTING DISABLED] the light basis + shadow tree, and returns (azimuth, elevation)
+        # [LIGHTING DISABLED] so a caller (e.g. the GUI) can sync slider positions to match.
+        # [LIGHTING DISABLED] Returns None if the room has no colors to estimate from.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] pts = np.asarray(self.room_pcd.points)
+        # [LIGHTING DISABLED] if not self.room_pcd.has_colors() or len(pts) < 200:
+            # [LIGHTING DISABLED] print("[light] Room has no usable colors/points to estimate from.")
+            # [LIGHTING DISABLED] return None
 
-        if not self.room_pcd.has_normals():
-            radius = max(self.room_scale * 0.02, 1e-3)
-            self.room_pcd.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
+        # [LIGHTING DISABLED] if not self.room_pcd.has_normals():
+            # [LIGHTING DISABLED] radius = max(self.room_scale * 0.02, 1e-3)
+            # [LIGHTING DISABLED] self.room_pcd.estimate_normals(
+                # [LIGHTING DISABLED] search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
 
-        normals = np.asarray(self.room_pcd.normals)
-        colors = np.asarray(self.room_pcd.colors)
-        luminance = colors @ np.array([0.2126, 0.7152, 0.0722])
+        # [LIGHTING DISABLED] normals = np.asarray(self.room_pcd.normals)
+        # [LIGHTING DISABLED] colors = np.asarray(self.room_pcd.colors)
+        # [LIGHTING DISABLED] luminance = colors @ np.array([0.2126, 0.7152, 0.0722])
 
-        def fit(n_arr, lum_arr):
-            A = np.hstack([n_arr, np.ones((len(n_arr), 1))])
-            sol, *_ = np.linalg.lstsq(A, lum_arr, rcond=None)
-            L = sol[:3]
-            norm = np.linalg.norm(L)
-            return L / norm if norm > 1e-8 else None
+        # [LIGHTING DISABLED] def fit(n_arr, lum_arr):
+            # [LIGHTING DISABLED] A = np.hstack([n_arr, np.ones((len(n_arr), 1))])
+            # [LIGHTING DISABLED] sol, *_ = np.linalg.lstsq(A, lum_arr, rcond=None)
+            # [LIGHTING DISABLED] L = sol[:3]
+            # [LIGHTING DISABLED] norm = np.linalg.norm(L)
+            # [LIGHTING DISABLED] return L / norm if norm > 1e-8 else None
 
-        L0 = fit(normals, luminance)
-        if L0 is None:
-            print("[light] Estimation failed (degenerate normals/colors).")
-            return None
+        # [LIGHTING DISABLED] L0 = fit(normals, luminance)
+        # [LIGHTING DISABLED] if L0 is None:
+            # [LIGHTING DISABLED] print("[light] Estimation failed (degenerate normals/colors).")
+            # [LIGHTING DISABLED] return None
 
         # Pass 2: refit using only the clearly front-lit points under L0,
         # which removes the terminator-clipping bias (see docstring).
-        alignment = normals @ L0
-        mask = alignment > np.percentile(alignment, 60)
-        L1 = fit(normals[mask], luminance[mask]) if np.count_nonzero(mask) > 10 else L0
-        L_toward_light = L1 if L1 is not None else L0
+        # [LIGHTING DISABLED] alignment = normals @ L0
+        # [LIGHTING DISABLED] mask = alignment > np.percentile(alignment, 60)
+        # [LIGHTING DISABLED] L1 = fit(normals[mask], luminance[mask]) if np.count_nonzero(mask) > 10 else L0
+        # [LIGHTING DISABLED] L_toward_light = L1 if L1 is not None else L0
 
-        light_travel = -L_toward_light  # our convention: direction the light TRAVELS
-        az = float(np.degrees(np.arctan2(light_travel[1], light_travel[0])) % 360)
-        el = float(np.degrees(np.arcsin(np.clip(-light_travel[2], -1, 1))))
-        el = float(np.clip(el, 1.0, 89.0))  # keep it a sane, non-degenerate angle
+        # [LIGHTING DISABLED] light_travel = -L_toward_light  # our convention: direction the light TRAVELS
+        # [LIGHTING DISABLED] az = float(np.degrees(np.arctan2(light_travel[1], light_travel[0])) % 360)
+        # [LIGHTING DISABLED] el = float(np.degrees(np.arcsin(np.clip(-light_travel[2], -1, 1))))
+        # [LIGHTING DISABLED] el = float(np.clip(el, 1.0, 89.0))  # keep it a sane, non-degenerate angle
 
-        self.LIGHT_AZIMUTH_DEG = az
-        self.LIGHT_ELEVATION_DEG = el
-        self._build_light_basis()
-        self._build_shadow_tree()
-        print(f"[light] Estimated from scene: azimuth={az:.1f}°, elevation={el:.1f}°")
-        return az, el
+        # [LIGHTING DISABLED] self.LIGHT_AZIMUTH_DEG = az
+        # [LIGHTING DISABLED] self.LIGHT_ELEVATION_DEG = el
+        # [LIGHTING DISABLED] self._build_light_basis()
+        # [LIGHTING DISABLED] self._build_shadow_tree()
+        # [LIGHTING DISABLED] print(f"[light] Estimated from scene: azimuth={az:.1f}°, elevation={el:.1f}°")
+        # [LIGHTING DISABLED] return az, el
 
     # ── CHANGE 18 — a visible marker for the CURRENT light, whichever mode ──
-    def build_light_gizmo(self):
-        """
-        Dispatches on self.LIGHT_MODE: a small glowing bulb at the point
-        light's world position, or the original arrow for the directional
-        "sun". Purely visual — rebuilt via _refresh_light_gizmo() any time
-        the light moves/changes or the mode is toggled.
-        """
-        if self.LIGHT_MODE == "point":
-            return self._build_point_light_gizmo()
-        return self._build_directional_light_gizmo()
+    # [LIGHTING DISABLED] def build_light_gizmo(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Dispatches on self.LIGHT_MODE: a small glowing bulb at the point
+        # [LIGHTING DISABLED] light's world position, or the original arrow for the directional
+        # [LIGHTING DISABLED] "sun". Purely visual — rebuilt via _refresh_light_gizmo() any time
+        # [LIGHTING DISABLED] the light moves/changes or the mode is toggled.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] if self.LIGHT_MODE == "point":
+            # [LIGHTING DISABLED] return self._build_point_light_gizmo()
+        # [LIGHTING DISABLED] return self._build_directional_light_gizmo()
 
-    def _build_point_light_gizmo(self):
-        """
-        A small bulb (sphere) at self.light_pos, plus a few short radiating
-        line "rays" purely so it doesn't get lost against the room's own
-        points — NOT the actual shadow rays used for shading (those go
-        from every object point to the bulb; see _compute_point_light_darken).
-        Returns a list of geometries; _refresh_light_gizmo() adds/removes
-        every item in the list as one unit.
-        """
-        radius = max(self.room_scale * 0.02, 1e-3)
-        bulb = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=14)
-        bulb.paint_uniform_color([1.0, 0.95, 0.55])
-        bulb.compute_vertex_normals()
-        bulb.translate(self.light_pos)
+    # [LIGHTING DISABLED] def _build_point_light_gizmo(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] A small bulb (sphere) at self.light_pos, plus a few short radiating
+        # [LIGHTING DISABLED] line "rays" purely so it doesn't get lost against the room's own
+        # [LIGHTING DISABLED] points — NOT the actual shadow rays used for shading (those go
+        # [LIGHTING DISABLED] from every object point to the bulb; see _compute_point_light_darken).
+        # [LIGHTING DISABLED] Returns a list of geometries; _refresh_light_gizmo() adds/removes
+        # [LIGHTING DISABLED] every item in the list as one unit.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] radius = max(self.room_scale * 0.02, 1e-3)
+        # [LIGHTING DISABLED] bulb = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=14)
+        # [LIGHTING DISABLED] bulb.paint_uniform_color([1.0, 0.95, 0.55])
+        # [LIGHTING DISABLED] bulb.compute_vertex_normals()
+        # [LIGHTING DISABLED] bulb.translate(self.light_pos)
 
-        dirs = np.array([
-            [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
-            [0, 0, 1], [0, 0, -1],
-            [1, 1, 0], [-1, -1, 0], [1, -1, 0], [-1, 1, 0],
-        ], dtype=np.float64)
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
-        ray_len = radius * 3.0
-        starts = self.light_pos[None, :] + dirs * radius * 1.3
-        ends = starts + dirs * ray_len
-        line_pts = np.vstack([starts, ends])
-        n_dirs = len(dirs)
-        lines = [[i, i + n_dirs] for i in range(n_dirs)]
-        rays = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(line_pts),
-            lines=o3d.utility.Vector2iVector(lines))
-        rays.paint_uniform_color([1.0, 0.85, 0.2])
+        # [LIGHTING DISABLED] dirs = np.array([
+            # [LIGHTING DISABLED] [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+            # [LIGHTING DISABLED] [0, 0, 1], [0, 0, -1],
+            # [LIGHTING DISABLED] [1, 1, 0], [-1, -1, 0], [1, -1, 0], [-1, 1, 0],
+        # [LIGHTING DISABLED] ], dtype=np.float64)
+        # [LIGHTING DISABLED] dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        # [LIGHTING DISABLED] ray_len = radius * 3.0
+        # [LIGHTING DISABLED] starts = self.light_pos[None, :] + dirs * radius * 1.3
+        # [LIGHTING DISABLED] ends = starts + dirs * ray_len
+        # [LIGHTING DISABLED] line_pts = np.vstack([starts, ends])
+        # [LIGHTING DISABLED] n_dirs = len(dirs)
+        # [LIGHTING DISABLED] lines = [[i, i + n_dirs] for i in range(n_dirs)]
+        # [LIGHTING DISABLED] rays = o3d.geometry.LineSet(
+            # [LIGHTING DISABLED] points=o3d.utility.Vector3dVector(line_pts),
+            # [LIGHTING DISABLED] lines=o3d.utility.Vector2iVector(lines))
+        # [LIGHTING DISABLED] rays.paint_uniform_color([1.0, 0.85, 0.2])
 
-        return [bulb, rays]
+        # [LIGHTING DISABLED] return [bulb, rays]
 
-    def _build_directional_light_gizmo(self):
-        """
-        Returns a TriangleMesh arrow pointing from the light's approximate
-        origin toward the scene, along the current self.light_dir. Purely
-        visual — rebuild and re-add it (via build_light_gizmo() again)
-        any time the light direction changes, so it stays in sync with
-        the azimuth/elevation sliders.
-        """
-        center = self.room_pcd.get_axis_aligned_bounding_box().get_center()
-        origin_dist = self.room_scale * 1.2
-        arrow_len = self.room_scale * 0.5
+    # [LIGHTING DISABLED] def _build_directional_light_gizmo(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Returns a TriangleMesh arrow pointing from the light's approximate
+        # [LIGHTING DISABLED] origin toward the scene, along the current self.light_dir. Purely
+        # [LIGHTING DISABLED] visual — rebuild and re-add it (via build_light_gizmo() again)
+        # [LIGHTING DISABLED] any time the light direction changes, so it stays in sync with
+        # [LIGHTING DISABLED] the azimuth/elevation sliders.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] center = self.room_pcd.get_axis_aligned_bounding_box().get_center()
+        # [LIGHTING DISABLED] origin_dist = self.room_scale * 1.2
+        # [LIGHTING DISABLED] arrow_len = self.room_scale * 0.5
 
-        arrow = o3d.geometry.TriangleMesh.create_arrow(
-            cylinder_radius=max(self.room_scale * 0.006, 1e-4),
-            cone_radius=max(self.room_scale * 0.014, 1e-4),
-            cylinder_height=arrow_len * 0.75,
-            cone_height=arrow_len * 0.25)
-        arrow.paint_uniform_color([1.0, 0.85, 0.0])
-        arrow.compute_vertex_normals()
+        # [LIGHTING DISABLED] arrow = o3d.geometry.TriangleMesh.create_arrow(
+            # [LIGHTING DISABLED] cylinder_radius=max(self.room_scale * 0.006, 1e-4),
+            # [LIGHTING DISABLED] cone_radius=max(self.room_scale * 0.014, 1e-4),
+            # [LIGHTING DISABLED] cylinder_height=arrow_len * 0.75,
+            # [LIGHTING DISABLED] cone_height=arrow_len * 0.25)
+        # [LIGHTING DISABLED] arrow.paint_uniform_color([1.0, 0.85, 0.0])
+        # [LIGHTING DISABLED] arrow.compute_vertex_normals()
 
         # create_arrow() points along +Z by default; rotate it to point
         # along self.light_dir instead, then place its tail at the
         # light's approximate origin (back away from the room along the
         # direction the light travels FROM).
-        z_axis = np.array([0.0, 0.0, 1.0])
-        d = self.light_dir
-        if np.linalg.norm(np.cross(z_axis, d)) < 1e-6:
-            R = np.eye(3) if d[2] > 0 else Rotation.from_rotvec(
-                np.pi * np.array([1.0, 0.0, 0.0])).as_matrix()
-        else:
-            axis = np.cross(z_axis, d)
-            axis /= np.linalg.norm(axis)
-            angle = np.arccos(np.clip(np.dot(z_axis, d), -1.0, 1.0))
-            R = Rotation.from_rotvec(axis * angle).as_matrix()
-        arrow.rotate(R, center=(0, 0, 0))
+        # [LIGHTING DISABLED] z_axis = np.array([0.0, 0.0, 1.0])
+        # [LIGHTING DISABLED] d = self.light_dir
+        # [LIGHTING DISABLED] if np.linalg.norm(np.cross(z_axis, d)) < 1e-6:
+            # [LIGHTING DISABLED] R = np.eye(3) if d[2] > 0 else Rotation.from_rotvec(
+                # [LIGHTING DISABLED] np.pi * np.array([1.0, 0.0, 0.0])).as_matrix()
+        # [LIGHTING DISABLED] else:
+            # [LIGHTING DISABLED] axis = np.cross(z_axis, d)
+            # [LIGHTING DISABLED] axis /= np.linalg.norm(axis)
+            # [LIGHTING DISABLED] angle = np.arccos(np.clip(np.dot(z_axis, d), -1.0, 1.0))
+            # [LIGHTING DISABLED] R = Rotation.from_rotvec(axis * angle).as_matrix()
+        # [LIGHTING DISABLED] arrow.rotate(R, center=(0, 0, 0))
 
-        origin = center - d * origin_dist
-        arrow.translate(origin)
-        return arrow
+        # [LIGHTING DISABLED] origin = center - d * origin_dist
+        # [LIGHTING DISABLED] arrow.translate(origin)
+        # [LIGHTING DISABLED] return arrow
 
     # ── CHANGE 15 — pure computation, no viewer side-effects, no lag ───────
-    def _compute_directional_darken(self):
-        """
-        Returns the per-point darken array for the object's CURRENT
-        position, using a directional shadow test instead of the old
-        overhead-count proxy. Does NOT touch obj_geom.colors or call
-        update_geometry — safe to call as often or as rarely as you like.
+    # [LIGHTING DISABLED] def _compute_directional_darken(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Returns the per-point darken array for the object's CURRENT
+        # [LIGHTING DISABLED] position, using a directional shadow test instead of the old
+        # [LIGHTING DISABLED] overhead-count proxy. Does NOT touch obj_geom.colors or call
+        # [LIGHTING DISABLED] update_geometry — safe to call as often or as rarely as you like.
 
-        Only runs when explicitly asked to (H = preview, or automatically
-        right before E/X export) — same lag-avoidance rule as before: this
-        is deliberately NOT wired into the per-keystroke move/rotate
-        handlers.
+        # [LIGHTING DISABLED] Only runs when explicitly asked to (H = preview, or automatically
+        # [LIGHTING DISABLED] right before E/X export) — same lag-avoidance rule as before: this
+        # [LIGHTING DISABLED] is deliberately NOT wired into the per-keystroke move/rotate
+        # [LIGHTING DISABLED] handlers.
 
-        Method: project every current object point into light space
-        (u, v, depth), where smaller depth = closer to the light. For
-        each point, do a radius search in (u, v) — i.e. "look along the
-        light ray" — against the static room's KD-tree (built once).
-        Any room point whose depth is smaller (closer to the light) than
-        this point's own depth, by more than a small bias, is something
-        already blocking the light before it reaches this point — count
-        it as an occluder. The occluder count saturates into a soft
-        darkening factor, the same way the original overhead-proxy's
-        point count did, just now restricted to the correct light-space
-        column instead of a raw vertical one.
+        # [LIGHTING DISABLED] Method: project every current object point into light space
+        # [LIGHTING DISABLED] (u, v, depth), where smaller depth = closer to the light. For
+        # [LIGHTING DISABLED] each point, do a radius search in (u, v) — i.e. "look along the
+        # [LIGHTING DISABLED] light ray" — against the static room's KD-tree (built once).
+        # [LIGHTING DISABLED] Any room point whose depth is smaller (closer to the light) than
+        # [LIGHTING DISABLED] this point's own depth, by more than a small bias, is something
+        # [LIGHTING DISABLED] already blocking the light before it reaches this point — count
+        # [LIGHTING DISABLED] it as an occluder. The occluder count saturates into a soft
+        # [LIGHTING DISABLED] darkening factor, the same way the original overhead-proxy's
+        # [LIGHTING DISABLED] point count did, just now restricted to the correct light-space
+        # [LIGHTING DISABLED] column instead of a raw vertical one.
 
-        A KD-tree radius search (rather than binning into a fixed grid)
-        is what makes this robust on sparse/uneven point clouds: it finds
-        whatever real points are actually nearby instead of requiring
-        them to land in one exact cell, so it doesn't leave "holes" that
-        silently read as unoccluded.
+        # [LIGHTING DISABLED] A KD-tree radius search (rather than binning into a fixed grid)
+        # [LIGHTING DISABLED] is what makes this robust on sparse/uneven point clouds: it finds
+        # [LIGHTING DISABLED] whatever real points are actually nearby instead of requiring
+        # [LIGHTING DISABLED] them to land in one exact cell, so it doesn't leave "holes" that
+        # [LIGHTING DISABLED] silently read as unoccluded.
 
-        CHANGE 16 — self-shadow is OFF by default (ENABLE_SELF_SHADOW).
-        A prior version always let the object shadow its own points too
-        (for concave objects like a seat shadowing its own legs). That
-        backfires badly on bushy/cluttered objects — a vase of flowers,
-        foliage, anything with lots of thin overlapping geometry — because
-        nearby points at slightly different depths trip the occluder
-        count almost everywhere, saturating it regardless of light
-        direction. That's what "changing the light angle does nothing"
-        looks like: the object is darkening itself, not the room. Turn
-        ENABLE_SELF_SHADOW back on only for solid, simple, genuinely
-        concave objects where you've confirmed it helps.
-        """
-        if self.obj_geom is None or self.obj_base_colors is None:
-            return None
+        # [LIGHTING DISABLED] CHANGE 16 — self-shadow is OFF by default (ENABLE_SELF_SHADOW).
+        # [LIGHTING DISABLED] A prior version always let the object shadow its own points too
+        # [LIGHTING DISABLED] (for concave objects like a seat shadowing its own legs). That
+        # [LIGHTING DISABLED] backfires badly on bushy/cluttered objects — a vase of flowers,
+        # [LIGHTING DISABLED] foliage, anything with lots of thin overlapping geometry — because
+        # [LIGHTING DISABLED] nearby points at slightly different depths trip the occluder
+        # [LIGHTING DISABLED] count almost everywhere, saturating it regardless of light
+        # [LIGHTING DISABLED] direction. That's what "changing the light angle does nothing"
+        # [LIGHTING DISABLED] looks like: the object is darkening itself, not the room. Turn
+        # [LIGHTING DISABLED] ENABLE_SELF_SHADOW back on only for solid, simple, genuinely
+        # [LIGHTING DISABLED] concave objects where you've confirmed it helps.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] if self.obj_geom is None or self.obj_base_colors is None:
+            # [LIGHTING DISABLED] return None
 
-        pts = np.asarray(self.obj_geom.points)
-        n = len(pts)
-        u, v, depth = self._to_light_space(pts)
-        uv = self._light_uv(u, v)
+        # [LIGHTING DISABLED] pts = np.asarray(self.obj_geom.points)
+        # [LIGHTING DISABLED] n = len(pts)
+        # [LIGHTING DISABLED] u, v, depth = self._to_light_space(pts)
+        # [LIGHTING DISABLED] uv = self._light_uv(u, v)
 
-        radius = max(self.room_scale * self.SHADOW_RADIUS_FRAC, 1e-4)
-        bias   = max(self.room_scale * self.SHADOW_BIAS_FRAC, 1e-5)
+        # [LIGHTING DISABLED] radius = max(self.room_scale * self.SHADOW_RADIUS_FRAC, 1e-4)
+        # [LIGHTING DISABLED] bias   = max(self.room_scale * self.SHADOW_BIAS_FRAC, 1e-5)
 
-        room_hits = (self.room_shadow_tree.query_ball_point(uv, r=radius, workers=-1)
-                     if self.room_shadow_tree is not None else [[] for _ in range(n)])
+        # [LIGHTING DISABLED] room_hits = (self.room_shadow_tree.query_ball_point(uv, r=radius, workers=-1)
+                     # [LIGHTING DISABLED] if self.room_shadow_tree is not None else [[] for _ in range(n)])
 
-        if self.ENABLE_SELF_SHADOW and n > 1:
+        # [LIGHTING DISABLED] if self.ENABLE_SELF_SHADOW and n > 1:
             # Self-occlusion uses the OBJECT's own scale for radius/bias,
             # not the room's — a vase is far smaller than the room, and
             # sizing its own self-shadow test off the room's scale is what
             # made it saturate almost instantly. Even with this fix,
             # leave it off for cluttered objects; see docstring above.
-            obj_scale = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
-            self_radius = max(obj_scale * self.SELF_SHADOW_RADIUS_FRAC, 1e-5)
-            self_bias   = max(obj_scale * self.SELF_SHADOW_BIAS_FRAC, 1e-6)
-            self_tree = cKDTree(uv)
-            self_hits = self_tree.query_ball_point(uv, r=self_radius, workers=-1)
-        else:
-            self_hits = None
-            self_bias = bias  # unused when self_hits is None
+            # [LIGHTING DISABLED] obj_scale = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+            # [LIGHTING DISABLED] self_radius = max(obj_scale * self.SELF_SHADOW_RADIUS_FRAC, 1e-5)
+            # [LIGHTING DISABLED] self_bias   = max(obj_scale * self.SELF_SHADOW_BIAS_FRAC, 1e-6)
+            # [LIGHTING DISABLED] self_tree = cKDTree(uv)
+            # [LIGHTING DISABLED] self_hits = self_tree.query_ball_point(uv, r=self_radius, workers=-1)
+        # [LIGHTING DISABLED] else:
+            # [LIGHTING DISABLED] self_hits = None
+            # [LIGHTING DISABLED] self_bias = bias  # unused when self_hits is None
 
-        darken = np.ones(n, dtype=np.float64)
-        for i in range(n):
-            occluding = 0
-            room_idx = room_hits[i]
-            if room_idx:
-                occluding += int(np.count_nonzero(
-                    self.room_light_depth[room_idx] < depth[i] - bias))
-            if self_hits is not None:
-                self_idx = self_hits[i]
-                if self_idx:
-                    occluding += int(np.count_nonzero(
-                        depth[self_idx] < depth[i] - self_bias))
-            if occluding:
-                shadow_fraction = min(occluding / self.SHADOW_SATURATE_COUNT, 1.0)
-                darken[i] = 1.0 - shadow_fraction * self.SHADOW_STRENGTH
+        # [LIGHTING DISABLED] darken = np.ones(n, dtype=np.float64)
+        # [LIGHTING DISABLED] for i in range(n):
+            # [LIGHTING DISABLED] occluding = 0
+            # [LIGHTING DISABLED] room_idx = room_hits[i]
+            # [LIGHTING DISABLED] if room_idx:
+                # [LIGHTING DISABLED] occluding += int(np.count_nonzero(
+                    # [LIGHTING DISABLED] self.room_light_depth[room_idx] < depth[i] - bias))
+            # [LIGHTING DISABLED] if self_hits is not None:
+                # [LIGHTING DISABLED] self_idx = self_hits[i]
+                # [LIGHTING DISABLED] if self_idx:
+                    # [LIGHTING DISABLED] occluding += int(np.count_nonzero(
+                        # [LIGHTING DISABLED] depth[self_idx] < depth[i] - self_bias))
+            # [LIGHTING DISABLED] if occluding:
+                # [LIGHTING DISABLED] shadow_fraction = min(occluding / self.SHADOW_SATURATE_COUNT, 1.0)
+                # [LIGHTING DISABLED] darken[i] = 1.0 - shadow_fraction * self.SHADOW_STRENGTH
 
-        return darken[:, None]
+        # [LIGHTING DISABLED] return darken[:, None]
 
     # ── CHANGE 18 — point-light counterpart to _compute_directional_darken ──
-    def _compute_point_light_darken(self):
-        """
-        The point-light analogue of _compute_directional_darken(). A point
-        light has no single shared direction for the whole scene — every
-        object point has its OWN direction and distance to self.light_pos —
-        so there's no one (u, v) plane to project everything onto. Instead,
-        each object point's shadow ray (itself → the bulb) is marched in
-        world space and sampled at a handful of points along the way; any
-        sample that lands near a real room point (via the plain 3D KD-tree
-        built in _build_shadow_tree) means something in the room is sitting
-        between that point and the light, so it counts as an occluder —
-        the direct per-ray equivalent of the directional method's shared
-        light-space column search.
+    # [LIGHTING DISABLED] def _compute_point_light_darken(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] The point-light analogue of _compute_directional_darken(). A point
+        # [LIGHTING DISABLED] light has no single shared direction for the whole scene — every
+        # [LIGHTING DISABLED] object point has its OWN direction and distance to self.light_pos —
+        # [LIGHTING DISABLED] so there's no one (u, v) plane to project everything onto. Instead,
+        # [LIGHTING DISABLED] each object point's shadow ray (itself → the bulb) is marched in
+        # [LIGHTING DISABLED] world space and sampled at a handful of points along the way; any
+        # [LIGHTING DISABLED] sample that lands near a real room point (via the plain 3D KD-tree
+        # [LIGHTING DISABLED] built in _build_shadow_tree) means something in the room is sitting
+        # [LIGHTING DISABLED] between that point and the light, so it counts as an occluder —
+        # [LIGHTING DISABLED] the direct per-ray equivalent of the directional method's shared
+        # [LIGHTING DISABLED] light-space column search.
 
-        On top of occlusion, ENABLE_DISTANCE_FALLOFF applies inverse-square
-        dimming with distance from the bulb — points near the light are
-        brighter, points far from it are dimmer, exactly like a real lamp.
-        A directional/sun light has no equivalent of this since it's
-        treated as infinitely far away, so every point is "the same
-        distance" from it.
-        """
-        if self.obj_geom is None or self.obj_base_colors is None:
-            return None
+        # [LIGHTING DISABLED] On top of occlusion, ENABLE_DISTANCE_FALLOFF applies inverse-square
+        # [LIGHTING DISABLED] dimming with distance from the bulb — points near the light are
+        # [LIGHTING DISABLED] brighter, points far from it are dimmer, exactly like a real lamp.
+        # [LIGHTING DISABLED] A directional/sun light has no equivalent of this since it's
+        # [LIGHTING DISABLED] treated as infinitely far away, so every point is "the same
+        # [LIGHTING DISABLED] distance" from it.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] if self.obj_geom is None or self.obj_base_colors is None:
+            # [LIGHTING DISABLED] return None
 
-        pts = np.asarray(self.obj_geom.points)
-        n = len(pts)
-        vec = self.light_pos[None, :] - pts            # point → light
-        dist = np.linalg.norm(vec, axis=1)
-        dist_safe = np.maximum(dist, 1e-6)
+        # [LIGHTING DISABLED] pts = np.asarray(self.obj_geom.points)
+        # [LIGHTING DISABLED] n = len(pts)
+        # [LIGHTING DISABLED] vec = self.light_pos[None, :] - pts            # point → light
+        # [LIGHTING DISABLED] dist = np.linalg.norm(vec, axis=1)
+        # [LIGHTING DISABLED] dist_safe = np.maximum(dist, 1e-6)
 
-        darken = np.ones(n, dtype=np.float64)
+        # [LIGHTING DISABLED] darken = np.ones(n, dtype=np.float64)
 
-        if self.room_kdtree_3d is not None and n > 0:
-            n_samp = max(int(self.POINT_SHADOW_SAMPLES), 1)
-            bias = float(np.clip(self.POINT_SHADOW_BIAS_FRAC, 0.0, 0.45))
-            ts = np.linspace(bias, 1.0 - bias, n_samp)       # skip both ray ends
+        # [LIGHTING DISABLED] if self.room_kdtree_3d is not None and n > 0:
+            # [LIGHTING DISABLED] n_samp = max(int(self.POINT_SHADOW_SAMPLES), 1)
+            # [LIGHTING DISABLED] bias = float(np.clip(self.POINT_SHADOW_BIAS_FRAC, 0.0, 0.45))
+            # [LIGHTING DISABLED] ts = np.linspace(bias, 1.0 - bias, n_samp)       # skip both ray ends
             # samples[i, s, :] = pts[i] + ts[s] * vec[i]
-            samples = pts[:, None, :] + ts[None, :, None] * vec[:, None, :]
-            samples_flat = samples.reshape(-1, 3)
+            # [LIGHTING DISABLED] samples = pts[:, None, :] + ts[None, :, None] * vec[:, None, :]
+            # [LIGHTING DISABLED] samples_flat = samples.reshape(-1, 3)
 
-            radius = max(self.room_scale * self.POINT_SHADOW_RADIUS_FRAC, 1e-4)
-            hits = self.room_kdtree_3d.query_ball_point(samples_flat, r=radius, workers=-1)
-            hit_counts = np.fromiter((len(h) for h in hits), dtype=np.int64, count=len(hits))
-            occluded_samples = (hit_counts.reshape(n, n_samp) > 0).sum(axis=1)
+            # [LIGHTING DISABLED] radius = max(self.room_scale * self.POINT_SHADOW_RADIUS_FRAC, 1e-4)
+            # [LIGHTING DISABLED] hits = self.room_kdtree_3d.query_ball_point(samples_flat, r=radius, workers=-1)
+            # [LIGHTING DISABLED] hit_counts = np.fromiter((len(h) for h in hits), dtype=np.int64, count=len(hits))
+            # [LIGHTING DISABLED] occluded_samples = (hit_counts.reshape(n, n_samp) > 0).sum(axis=1)
 
             # Soft shadow: fraction of the ray's SAMPLED length that's
             # blocked, same saturating-into-a-darkening-factor idea as the
             # directional method (just per-ray instead of per-count-vs-a-
             # fixed-threshold, since here every point has its own ray).
-            shadow_fraction = np.minimum(occluded_samples / (n_samp * 0.5), 1.0)
-            darken = 1.0 - shadow_fraction * self.SHADOW_STRENGTH
+            # [LIGHTING DISABLED] shadow_fraction = np.minimum(occluded_samples / (n_samp * 0.5), 1.0)
+            # [LIGHTING DISABLED] darken = 1.0 - shadow_fraction * self.SHADOW_STRENGTH
 
-        if self.ENABLE_DISTANCE_FALLOFF:
-            ref_dist = max(self.room_scale * 0.5, 1e-6)   # ~neutral at mid-room
-            atten = np.clip((ref_dist / dist_safe) ** 2, 0.35, 1.8)
-            darken = darken * atten
+        # [LIGHTING DISABLED] if self.ENABLE_DISTANCE_FALLOFF:
+            # [LIGHTING DISABLED] ref_dist = max(self.room_scale * 0.5, 1e-6)   # ~neutral at mid-room
+            # [LIGHTING DISABLED] atten = np.clip((ref_dist / dist_safe) ** 2, 0.35, 1.8)
+            # [LIGHTING DISABLED] darken = darken * atten
 
-        return darken[:, None]
+        # [LIGHTING DISABLED] return darken[:, None]
 
-    def _apply_occlusion_shading(self, vis=None):
-        """
-        Computes shading for the CURRENT position and pushes it to both
-        the viewer (obj_geom.colors) and the export cache
-        (last_occlusion_darken). Only called explicitly now — see H key
-        and _export_gaussians/_export_object_only — never from the
-        per-keystroke move/rotate handlers. Accepts an optional unused
-        `vis` arg so it can also be wired up directly as a key callback.
+    # [LIGHTING DISABLED] def _apply_occlusion_shading(self, vis=None):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Computes shading for the CURRENT position and pushes it to both
+        # [LIGHTING DISABLED] the viewer (obj_geom.colors) and the export cache
+        # [LIGHTING DISABLED] (last_occlusion_darken). Only called explicitly now — see H key
+        # [LIGHTING DISABLED] and _export_gaussians/_export_object_only — never from the
+        # [LIGHTING DISABLED] per-keystroke move/rotate handlers. Accepts an optional unused
+        # [LIGHTING DISABLED] `vis` arg so it can also be wired up directly as a key callback.
 
-        CHANGE 18: dispatches on self.LIGHT_MODE — "point" uses the new
-        in-room point light, "directional" uses the original sun-like
-        light. Both keep working; the mode just picks which one is live.
-        """
-        if self.LIGHT_MODE == "point":
-            darken = self._compute_point_light_darken()
-        else:
-            darken = self._compute_directional_darken()
-        if darken is None:
-            return False
-        self.last_occlusion_darken = darken
-        shaded = np.clip(self.obj_base_colors * darken, 0.0, 1.0)
-        self.obj_geom.colors = o3d.utility.Vector3dVector(shaded)
-        self.vis.update_geometry(self.obj_geom)
-        if self.LIGHT_MODE == "point":
-            print(f"[shading] Re-lit object at current position "
-                  f"(mean darken factor: {darken.mean():.2f}, "
-                  f"point light at {np.round(self.light_pos, 2).tolist()}).")
-        else:
-            print(f"[shading] Re-lit object at current position "
-                  f"(mean darken factor: {darken.mean():.2f}, "
-                  f"light az={self.LIGHT_AZIMUTH_DEG:.0f}° el={self.LIGHT_ELEVATION_DEG:.0f}°).")
-        return False
+        # [LIGHTING DISABLED] CHANGE 18: dispatches on self.LIGHT_MODE — "point" uses the new
+        # [LIGHTING DISABLED] in-room point light, "directional" uses the original sun-like
+        # [LIGHTING DISABLED] light. Both keep working; the mode just picks which one is live.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] if self.LIGHT_MODE == "point":
+            # [LIGHTING DISABLED] darken = self._compute_point_light_darken()
+        # [LIGHTING DISABLED] else:
+            # [LIGHTING DISABLED] darken = self._compute_directional_darken()
+        # [LIGHTING DISABLED] if darken is None:
+            # [LIGHTING DISABLED] return False
+        # [LIGHTING DISABLED] self.last_occlusion_darken = darken
+        # [LIGHTING DISABLED] shaded = np.clip(self.obj_base_colors * darken, 0.0, 1.0)
+        # [LIGHTING DISABLED] self.obj_geom.colors = o3d.utility.Vector3dVector(shaded)
+        # [LIGHTING DISABLED] self.vis.update_geometry(self.obj_geom)
+        # [LIGHTING DISABLED] if self.LIGHT_MODE == "point":
+            # [LIGHTING DISABLED] print(f"[shading] Re-lit object at current position "
+                  # [LIGHTING DISABLED] f"(mean darken factor: {darken.mean():.2f}, "
+                  # [LIGHTING DISABLED] f"point light at {np.round(self.light_pos, 2).tolist()}).")
+        # [LIGHTING DISABLED] else:
+            # [LIGHTING DISABLED] print(f"[shading] Re-lit object at current position "
+                  # [LIGHTING DISABLED] f"(mean darken factor: {darken.mean():.2f}, "
+                  # [LIGHTING DISABLED] f"light az={self.LIGHT_AZIMUTH_DEG:.0f}° el={self.LIGHT_ELEVATION_DEG:.0f}°).")
+        # [LIGHTING DISABLED] return False
 
     # ── geometry transforms (pivot = object's own centroid) ────────────────
     def _apply_translation(self, delta):
@@ -2043,19 +2248,19 @@ class CombinedScene:
         os.makedirs(out_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(out_dir, f"scene_splat_{ts}.ply")
-        # CHANGE 13: single shading pass here, at the object's FINAL pose —
-        # this is the only place the KD-tree query now runs. Also updates
-        # obj_geom.colors so the viewer's last-visible frame matches the
+        # [LIGHTING DISABLED] CHANGE 13: single shading pass here, at the object's
+        # FINAL pose — this is the only place the KD-tree query now runs. Also
+        # updates obj_geom.colors so the viewer's last-visible frame matches the
         # exported file, without having paid that cost on every move.
-        print("[export] Computing occlusion shading for final pose …")
-        self._apply_occlusion_shading()
-        self.vis.update_geometry(self.obj_geom)
+        # print("[export] Computing occlusion shading for final pose …")
+        # self._apply_occlusion_shading()
+        # self.vis.update_geometry(self.obj_geom)
         try:
             n_room, n_obj = export_scene_as_gaussian_splat(
                 self.room_pcd, self.job, self.R_total,
                 self.base_centroid, self.centroid, out_path,
                 src=self.src, room_src_idx=self.room_src_idx,
-                darken=self._export_darken())
+                darken=None)  # [LIGHTING DISABLED] was: darken=self._export_darken()
             print(f"[export] {n_room:,} room + {n_obj:,} object gaussians "
                   f"({n_room + n_obj:,} total) → {out_path}")
             print("[export] Standard 3DGS layout (x,y,z / f_dc / opacity / "
@@ -2078,14 +2283,14 @@ class CombinedScene:
         os.makedirs(out_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(out_dir, f"object_splat_{ts}.ply")
-        # CHANGE 13: same one-shot shading pass as scene export.
-        print("[export] Computing occlusion shading for final pose …")
-        self._apply_occlusion_shading()
-        self.vis.update_geometry(self.obj_geom)
+        # [LIGHTING DISABLED] CHANGE 13: same one-shot shading pass as scene export.
+        # print("[export] Computing occlusion shading for final pose …")
+        # self._apply_occlusion_shading()
+        # self.vis.update_geometry(self.obj_geom)
         try:
             n = export_object_as_gaussian_splat(
                 self.job, self.R_total, self.base_centroid, self.centroid, out_path,
-                darken=self._export_darken())
+                darken=None)  # [LIGHTING DISABLED] was: darken=self._export_darken()
             print(f"[export] {n:,} gaussians (object only) → {out_path}")
         except Exception:
             import traceback
@@ -2126,7 +2331,7 @@ class CombinedScene:
         self.vis.register_key_callback(ord("Y"), rotate([0, 0, 1], +1))
 
         self.vis.register_key_callback(ord("R"), self._reset_object)
-        self.vis.register_key_callback(ord("H"), self._apply_occlusion_shading)
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("H"), self._apply_occlusion_shading)
         self.vis.register_key_callback(ord("E"), self._export_gaussians)
         self.vis.register_key_callback(ord("X"), self._export_object_only)
 
@@ -2134,51 +2339,51 @@ class CombinedScene:
         # Only acts while LIGHT_MODE == "point" (harmless no-op otherwise).
         # Reuses self._step() so the light nudges by the same room-scaled
         # amount the object does with J/L/I/K/U/O.
-        def nudge_light(dx=0.0, dy=0.0, dz=0.0):
-            def cb(vis):
-                if self.LIGHT_MODE == "point":
-                    self.move_light(np.array([dx, dy, dz]) * self._step())
-                    self._refresh_light_gizmo()
-                    if self.obj_geom is not None:
-                        self._apply_occlusion_shading()
-                return False
-            return cb
+        # [LIGHTING DISABLED] def nudge_light(dx=0.0, dy=0.0, dz=0.0):
+            # [LIGHTING DISABLED] def cb(vis):
+                # [LIGHTING DISABLED] if self.LIGHT_MODE == "point":
+                    # [LIGHTING DISABLED] self.move_light(np.array([dx, dy, dz]) * self._step())
+                    # [LIGHTING DISABLED] self._refresh_light_gizmo()
+                    # [LIGHTING DISABLED] if self.obj_geom is not None:
+                        # [LIGHTING DISABLED] self._apply_occlusion_shading()
+                # [LIGHTING DISABLED] return False
+            # [LIGHTING DISABLED] return cb
 
-        self.vis.register_key_callback(ord("A"), nudge_light(dx=-1))
-        self.vis.register_key_callback(ord("D"), nudge_light(dx=+1))
-        self.vis.register_key_callback(ord("S"), nudge_light(dy=-1))
-        self.vis.register_key_callback(ord("W"), nudge_light(dy=+1))
-        self.vis.register_key_callback(ord("F"), nudge_light(dz=-1))  # down
-        self.vis.register_key_callback(ord("V"), nudge_light(dz=+1))  # up
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("A"), nudge_light(dx=-1))
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("D"), nudge_light(dx=+1))
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("S"), nudge_light(dy=-1))
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("W"), nudge_light(dy=+1))
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("F"), nudge_light(dz=-1))  # down
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("V"), nudge_light(dz=+1))  # up
 
-        def toggle_light_mode(vis):
-            self.LIGHT_MODE = "directional" if self.LIGHT_MODE == "point" else "point"
-            self._refresh_light_gizmo()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
-            print(f"[light] Mode switched to '{self.LIGHT_MODE}'.")
-            return False
+        # [LIGHTING DISABLED] def toggle_light_mode(vis):
+            # [LIGHTING DISABLED] self.LIGHT_MODE = "directional" if self.LIGHT_MODE == "point" else "point"
+            # [LIGHTING DISABLED] self._refresh_light_gizmo()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
+            # [LIGHTING DISABLED] print(f"[light] Mode switched to '{self.LIGHT_MODE}'.")
+            # [LIGHTING DISABLED] return False
 
-        self.vis.register_key_callback(ord("B"), toggle_light_mode)
+        # [LIGHTING DISABLED] self.vis.register_key_callback(ord("B"), toggle_light_mode)
 
     # ── CHANGE 12 — safe accessor for export ────────────────────────────────
-    def _export_darken(self):
-        """
-        Returns the darken array from the most recent occlusion-shading
-        pass, IF its length still matches job.gauss (it always should,
-        since obj_geom is job.splat_pcd itself and is never resampled/
-        reordered — see SplatJob.run). Guards anyway so a future change to
-        the fitting pipeline fails safe (full brightness) instead of
-        silently mis-mapping colors to the wrong points on export.
-        """
-        d = self.last_occlusion_darken
-        if d is None or self.job.gauss is None:
-            return None
-        if len(d) != len(self.job.gauss["mean"]):
-            print("[export] Occlusion-darken array length mismatch — "
-                  "exporting at full brightness instead of guessing.")
-            return None
-        return d
+    # [LIGHTING DISABLED] def _export_darken(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Returns the darken array from the most recent occlusion-shading
+        # [LIGHTING DISABLED] pass, IF its length still matches job.gauss (it always should,
+        # [LIGHTING DISABLED] since obj_geom is job.splat_pcd itself and is never resampled/
+        # [LIGHTING DISABLED] reordered — see SplatJob.run). Guards anyway so a future change to
+        # [LIGHTING DISABLED] the fitting pipeline fails safe (full brightness) instead of
+        # [LIGHTING DISABLED] silently mis-mapping colors to the wrong points on export.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] d = self.last_occlusion_darken
+        # [LIGHTING DISABLED] if d is None or self.job.gauss is None:
+            # [LIGHTING DISABLED] return None
+        # [LIGHTING DISABLED] if len(d) != len(self.job.gauss["mean"]):
+            # [LIGHTING DISABLED] print("[export] Occlusion-darken array length mismatch — "
+                  # [LIGHTING DISABLED] "exporting at full brightness instead of guessing.")
+            # [LIGHTING DISABLED] return None
+        # [LIGHTING DISABLED] return d
 
     def _step(self):
         # Scale movement step to the room's size so it feels consistent
@@ -2232,177 +2437,179 @@ class CombinedScene:
 
     # ── manual run loop so we can poll the background thread ───────────────
     # ── CHANGE 17 — optional light-control side panel ───────────────────────
-    def _build_light_panel(self):
-        """
-        A small tkinter side window (same toolkit ObjectPickerApp already
-        uses) with an "Estimate light from scene" button and two sliders
-        for azimuth/elevation. Runs alongside the existing Open3D viewer —
-        it does NOT take over the render loop; run() pumps it once per
-        iteration via panel.update_idletasks()/update(), the same way
-        vis.poll_events()/update_renderer() are already pumped manually.
-        This avoids any cross-thread Tk/GLFW interaction entirely.
-        """
-        root = tk.Tk()
-        root.title("Light control")
-        root.geometry("330x560")
+    # [LIGHTING DISABLED] def _build_light_panel(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] A small tkinter side window (same toolkit ObjectPickerApp already
+        # [LIGHTING DISABLED] uses) with an "Estimate light from scene" button and two sliders
+        # [LIGHTING DISABLED] for azimuth/elevation. Runs alongside the existing Open3D viewer —
+        # [LIGHTING DISABLED] it does NOT take over the render loop; run() pumps it once per
+        # [LIGHTING DISABLED] iteration via panel.update_idletasks()/update(), the same way
+        # [LIGHTING DISABLED] vis.poll_events()/update_renderer() are already pumped manually.
+        # [LIGHTING DISABLED] This avoids any cross-thread Tk/GLFW interaction entirely.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] root = tk.Tk()
+        # [LIGHTING DISABLED] root.title("Light control")
+        # [LIGHTING DISABLED] root.geometry("330x560")
 
         # ── CHANGE 18 — mode toggle: point light (inside the room) vs the
         # original directional "sun" (outside the room). Both stay fully
         # configured at all times; this just picks which one is live.
-        tk.Label(root, text="Light type", font=("", 10, "bold")).pack(pady=(12, 2))
-        mode_var = tk.StringVar(value=self.LIGHT_MODE)
+        # [LIGHTING DISABLED] tk.Label(root, text="Light type", font=("", 10, "bold")).pack(pady=(12, 2))
+        # [LIGHTING DISABLED] mode_var = tk.StringVar(value=self.LIGHT_MODE)
 
-        def on_mode_changed():
-            self.LIGHT_MODE = mode_var.get()
-            self._refresh_light_gizmo()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
+        # [LIGHTING DISABLED] def on_mode_changed():
+            # [LIGHTING DISABLED] self.LIGHT_MODE = mode_var.get()
+            # [LIGHTING DISABLED] self._refresh_light_gizmo()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
 
-        mode_frame = tk.Frame(root)
-        mode_frame.pack()
-        tk.Radiobutton(mode_frame, text="Point (movable, inside the room)",
-                       variable=mode_var, value="point",
-                       command=on_mode_changed).pack(anchor="w")
-        tk.Radiobutton(mode_frame, text="Directional (sun, outside the room)",
-                       variable=mode_var, value="directional",
-                       command=on_mode_changed).pack(anchor="w")
+        # [LIGHTING DISABLED] mode_frame = tk.Frame(root)
+        # [LIGHTING DISABLED] mode_frame.pack()
+        # [LIGHTING DISABLED] tk.Radiobutton(mode_frame, text="Point (movable, inside the room)",
+                       # [LIGHTING DISABLED] variable=mode_var, value="point",
+                       # [LIGHTING DISABLED] command=on_mode_changed).pack(anchor="w")
+        # [LIGHTING DISABLED] tk.Radiobutton(mode_frame, text="Directional (sun, outside the room)",
+                       # [LIGHTING DISABLED] variable=mode_var, value="directional",
+                       # [LIGHTING DISABLED] command=on_mode_changed).pack(anchor="w")
 
         # ── Point light position — the new part: drag it anywhere inside
         # the room's own bounding box. ───────────────────────────────────
-        point_frame = tk.LabelFrame(root, text="Point light position")
-        point_frame.pack(fill="x", padx=10, pady=(12, 4))
+        # [LIGHTING DISABLED] point_frame = tk.LabelFrame(root, text="Point light position")
+        # [LIGHTING DISABLED] point_frame.pack(fill="x", padx=10, pady=(12, 4))
 
-        def on_pos_changed(_=None):
-            self.light_pos = np.clip(
-                np.array([x_var.get(), y_var.get(), z_var.get()]),
-                self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
-            self._refresh_light_gizmo()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
+        # [LIGHTING DISABLED] def on_pos_changed(_=None):
+            # [LIGHTING DISABLED] self.light_pos = np.clip(
+                # [LIGHTING DISABLED] np.array([x_var.get(), y_var.get(), z_var.get()]),
+                # [LIGHTING DISABLED] self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
+            # [LIGHTING DISABLED] self._refresh_light_gizmo()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
 
-        x_var = tk.DoubleVar(value=round(float(self.light_pos[0]), 3))
-        y_var = tk.DoubleVar(value=round(float(self.light_pos[1]), 3))
-        z_var = tk.DoubleVar(value=round(float(self.light_pos[2]), 3))
-        for label, var, lo, hi in (
-            ("X", x_var, self.LIGHT_POS_MIN[0], self.LIGHT_POS_MAX[0]),
-            ("Y", y_var, self.LIGHT_POS_MIN[1], self.LIGHT_POS_MAX[1]),
-            ("Z  (height)", z_var, self.LIGHT_POS_MIN[2], self.LIGHT_POS_MAX[2]),
-        ):
-            tk.Label(point_frame, text=label).pack()
-            step = max((hi - lo) / 200.0, 1e-4)
-            tk.Scale(point_frame, from_=float(lo), to=float(hi), orient="horizontal",
-                     variable=var, resolution=step, length=290,
-                     command=on_pos_changed).pack()
+        # [LIGHTING DISABLED] x_var = tk.DoubleVar(value=round(float(self.light_pos[0]), 3))
+        # [LIGHTING DISABLED] y_var = tk.DoubleVar(value=round(float(self.light_pos[1]), 3))
+        # [LIGHTING DISABLED] z_var = tk.DoubleVar(value=round(float(self.light_pos[2]), 3))
+        # [LIGHTING DISABLED] for label, var, lo, hi in (
+            # [LIGHTING DISABLED] ("X", x_var, self.LIGHT_POS_MIN[0], self.LIGHT_POS_MAX[0]),
+            # [LIGHTING DISABLED] ("Y", y_var, self.LIGHT_POS_MIN[1], self.LIGHT_POS_MAX[1]),
+            # [LIGHTING DISABLED] ("Z  (height)", z_var, self.LIGHT_POS_MIN[2], self.LIGHT_POS_MAX[2]),
+        # [LIGHTING DISABLED] ):
+            # [LIGHTING DISABLED] tk.Label(point_frame, text=label).pack()
+            # [LIGHTING DISABLED] step = max((hi - lo) / 200.0, 1e-4)
+            # [LIGHTING DISABLED] tk.Scale(point_frame, from_=float(lo), to=float(hi), orient="horizontal",
+                     # [LIGHTING DISABLED] variable=var, resolution=step, length=290,
+                     # [LIGHTING DISABLED] command=on_pos_changed).pack()
 
-        falloff_var = tk.BooleanVar(value=self.ENABLE_DISTANCE_FALLOFF)
+        # [LIGHTING DISABLED] falloff_var = tk.BooleanVar(value=self.ENABLE_DISTANCE_FALLOFF)
 
-        def on_falloff_changed():
-            self.ENABLE_DISTANCE_FALLOFF = falloff_var.get()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
+        # [LIGHTING DISABLED] def on_falloff_changed():
+            # [LIGHTING DISABLED] self.ENABLE_DISTANCE_FALLOFF = falloff_var.get()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
 
-        tk.Checkbutton(point_frame, text="Dim with distance from the bulb",
-                       variable=falloff_var,
-                       command=on_falloff_changed).pack(pady=(2, 6))
+        # [LIGHTING DISABLED] tk.Checkbutton(point_frame, text="Dim with distance from the bulb",
+                       # [LIGHTING DISABLED] variable=falloff_var,
+                       # [LIGHTING DISABLED] command=on_falloff_changed).pack(pady=(2, 6))
 
         # ── Directional angle — the original sun controls, unchanged ──────
-        dir_frame = tk.LabelFrame(root, text="Directional light angle")
-        dir_frame.pack(fill="x", padx=10, pady=(4, 4))
+        # [LIGHTING DISABLED] dir_frame = tk.LabelFrame(root, text="Directional light angle")
+        # [LIGHTING DISABLED] dir_frame.pack(fill="x", padx=10, pady=(4, 4))
 
-        def on_light_changed(_=None):
-            self.LIGHT_AZIMUTH_DEG = az_var.get()
-            self.LIGHT_ELEVATION_DEG = el_var.get()
-            self._build_light_basis()
-            self._build_shadow_tree()
-            self._refresh_light_gizmo()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
+        # [LIGHTING DISABLED] def on_light_changed(_=None):
+            # [LIGHTING DISABLED] self.LIGHT_AZIMUTH_DEG = az_var.get()
+            # [LIGHTING DISABLED] self.LIGHT_ELEVATION_DEG = el_var.get()
+            # [LIGHTING DISABLED] self._build_light_basis()
+            # [LIGHTING DISABLED] self._build_shadow_tree()
+            # [LIGHTING DISABLED] self._refresh_light_gizmo()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
 
-        tk.Label(dir_frame, text="Azimuth (°)").pack(pady=(6, 0))
-        az_var = tk.DoubleVar(value=self.LIGHT_AZIMUTH_DEG)
-        tk.Scale(dir_frame, from_=0, to=360, orient="horizontal",
-                 variable=az_var, resolution=1, length=290,
-                 command=on_light_changed).pack()
+        # [LIGHTING DISABLED] tk.Label(dir_frame, text="Azimuth (°)").pack(pady=(6, 0))
+        # [LIGHTING DISABLED] az_var = tk.DoubleVar(value=self.LIGHT_AZIMUTH_DEG)
+        # [LIGHTING DISABLED] tk.Scale(dir_frame, from_=0, to=360, orient="horizontal",
+                 # [LIGHTING DISABLED] variable=az_var, resolution=1, length=290,
+                 # [LIGHTING DISABLED] command=on_light_changed).pack()
 
-        tk.Label(dir_frame, text="Elevation (°)").pack(pady=(6, 0))
-        el_var = tk.DoubleVar(value=self.LIGHT_ELEVATION_DEG)
-        tk.Scale(dir_frame, from_=1, to=89, orient="horizontal",
-                 variable=el_var, resolution=1, length=290,
-                 command=on_light_changed).pack()
+        # [LIGHTING DISABLED] tk.Label(dir_frame, text="Elevation (°)").pack(pady=(6, 0))
+        # [LIGHTING DISABLED] el_var = tk.DoubleVar(value=self.LIGHT_ELEVATION_DEG)
+        # [LIGHTING DISABLED] tk.Scale(dir_frame, from_=1, to=89, orient="horizontal",
+                 # [LIGHTING DISABLED] variable=el_var, resolution=1, length=290,
+                 # [LIGHTING DISABLED] command=on_light_changed).pack()
 
-        def on_estimate():
-            result = self.estimate_light_from_scene()
-            if result is None:
-                return
-            az, el = result
-            az_var.set(round(az, 1))
-            el_var.set(round(el, 1))
+        # [LIGHTING DISABLED] def on_estimate():
+            # [LIGHTING DISABLED] result = self.estimate_light_from_scene()
+            # [LIGHTING DISABLED] if result is None:
+                # [LIGHTING DISABLED] return
+            # [LIGHTING DISABLED] az, el = result
+            # [LIGHTING DISABLED] az_var.set(round(az, 1))
+            # [LIGHTING DISABLED] el_var.set(round(el, 1))
 
             # Also give the POINT light a reasonable starting position along
             # the same estimated direction — walked in from the room center
             # toward the wall the light seems to come from, then clamped
             # inside the room, so switching to point mode afterward doesn't
             # start you at a default ceiling-center guess.
-            center = np.asarray(self.room_pcd.get_axis_aligned_bounding_box().get_center())
-            inward = -self.light_dir  # direction from that wall back toward the room
-            candidate = center + inward * self.room_scale * 0.25
-            candidate = np.clip(candidate, self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
-            self.light_pos = candidate
-            x_var.set(round(float(candidate[0]), 3))
-            y_var.set(round(float(candidate[1]), 3))
-            z_var.set(round(float(candidate[2]), 3))
+            # [LIGHTING DISABLED] center = np.asarray(self.room_pcd.get_axis_aligned_bounding_box().get_center())
+            # [LIGHTING DISABLED] inward = -self.light_dir  # direction from that wall back toward the room
+            # [LIGHTING DISABLED] candidate = center + inward * self.room_scale * 0.25
+            # [LIGHTING DISABLED] candidate = np.clip(candidate, self.LIGHT_POS_MIN, self.LIGHT_POS_MAX)
+            # [LIGHTING DISABLED] self.light_pos = candidate
+            # [LIGHTING DISABLED] x_var.set(round(float(candidate[0]), 3))
+            # [LIGHTING DISABLED] y_var.set(round(float(candidate[1]), 3))
+            # [LIGHTING DISABLED] z_var.set(round(float(candidate[2]), 3))
 
-            self._refresh_light_gizmo()
-            if self.obj_geom is not None:
-                self._apply_occlusion_shading()
+            # [LIGHTING DISABLED] self._refresh_light_gizmo()
+            # [LIGHTING DISABLED] if self.obj_geom is not None:
+                # [LIGHTING DISABLED] self._apply_occlusion_shading()
 
-        tk.Button(root, text="Estimate light from scene",
-                  command=on_estimate).pack(pady=(14, 6))
-        tk.Label(root, text="Point light also moves with A/D/S/W/F/V.\n"
-                             "B toggles Point ↔ Directional.\n"
-                             "Object still moves with J/L/I/K/U/O etc.",
-                 fg="gray30", justify="center").pack(pady=(10, 0))
+        # [LIGHTING DISABLED] tk.Button(root, text="Estimate light from scene",
+                  # [LIGHTING DISABLED] command=on_estimate).pack(pady=(14, 6))
+        # [LIGHTING DISABLED] tk.Label(root, text="Point light also moves with A/D/S/W/F/V.\n"
+                             # [LIGHTING DISABLED] "B toggles Point ↔ Directional.\n"
+                             # [LIGHTING DISABLED] "Object still moves with J/L/I/K/U/O etc.",
+                 # [LIGHTING DISABLED] fg="gray30", justify="center").pack(pady=(10, 0))
 
-        root.protocol("WM_DELETE_WINDOW", lambda: None)  # closing the panel
+        # [LIGHTING DISABLED] root.protocol("WM_DELETE_WINDOW", lambda: None)  # closing the panel
                                                           # alone shouldn't
                                                           # kill the viewer
-        return root
+        # [LIGHTING DISABLED] return root
 
-    def _refresh_light_gizmo(self):
-        """
-        Rebuilds the light gizmo (yellow bulb+rays for a point light, or
-        the yellow arrow for a directional one) and re-adds it to the SAME
-        viewer the object/room already live in, so it stays in sync
-        whenever the light moves/changes (slider drag, key nudge, estimate,
-        or a mode toggle).
+    # [LIGHTING DISABLED] def _refresh_light_gizmo(self):
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] Rebuilds the light gizmo (yellow bulb+rays for a point light, or
+        # [LIGHTING DISABLED] the yellow arrow for a directional one) and re-adds it to the SAME
+        # [LIGHTING DISABLED] viewer the object/room already live in, so it stays in sync
+        # [LIGHTING DISABLED] whenever the light moves/changes (slider drag, key nudge, estimate,
+        # [LIGHTING DISABLED] or a mode toggle).
 
-        CHANGE 18: build_light_gizmo() can now return either a single
-        geometry (the directional arrow) or a list of geometries (the
-        point light's bulb + rays); this normalizes both cases so add/
-        remove always happens per-item.
-        """
-        new_gizmo = self.build_light_gizmo()
-        new_list = list(new_gizmo) if isinstance(new_gizmo, (list, tuple)) else [new_gizmo]
+        # [LIGHTING DISABLED] CHANGE 18: build_light_gizmo() can now return either a single
+        # [LIGHTING DISABLED] geometry (the directional arrow) or a list of geometries (the
+        # [LIGHTING DISABLED] point light's bulb + rays); this normalizes both cases so add/
+        # [LIGHTING DISABLED] remove always happens per-item.
+        # [LIGHTING DISABLED] """
+        # [LIGHTING DISABLED] new_gizmo = self.build_light_gizmo()
+        # [LIGHTING DISABLED] new_list = list(new_gizmo) if isinstance(new_gizmo, (list, tuple)) else [new_gizmo]
 
-        old_gizmo = getattr(self, "light_gizmo", None)
-        if old_gizmo is not None:
-            old_list = list(old_gizmo) if isinstance(old_gizmo, (list, tuple)) else [old_gizmo]
-            for g in old_list:
-                self.vis.remove_geometry(g, reset_bounding_box=False)
+        # [LIGHTING DISABLED] old_gizmo = getattr(self, "light_gizmo", None)
+        # [LIGHTING DISABLED] if old_gizmo is not None:
+            # [LIGHTING DISABLED] old_list = list(old_gizmo) if isinstance(old_gizmo, (list, tuple)) else [old_gizmo]
+            # [LIGHTING DISABLED] for g in old_list:
+                # [LIGHTING DISABLED] self.vis.remove_geometry(g, reset_bounding_box=False)
 
-        self.light_gizmo = new_list
-        for g in new_list:
-            self.vis.add_geometry(g, reset_bounding_box=False)
+        # [LIGHTING DISABLED] self.light_gizmo = new_list
+        # [LIGHTING DISABLED] for g in new_list:
+            # [LIGHTING DISABLED] self.vis.add_geometry(g, reset_bounding_box=False)
 
     def run(self, light_gui=False):
         print("Room loaded. Splatting selected object in the background …")
         panel = None
-        if light_gui:
-            panel = self._build_light_panel()
-            self.light_gizmo = None
-            self._refresh_light_gizmo()
-            print("[light] Light control panel opened — drag the sliders or "
-                  "click 'Estimate light from scene'.")
+        # [LIGHTING DISABLED] light-control side panel is disabled — the panel
+        # and its gizmo depended on the (now commented-out) light pipeline.
+        # if light_gui:
+        #     panel = self._build_light_panel()
+        #     self.light_gizmo = None
+        #     self._refresh_light_gizmo()
+        #     print("[light] Light control panel opened — drag the sliders or "
+        #           "click 'Estimate light from scene'.")
         try:
             while True:
                 self.try_attach_object()
@@ -2490,6 +2697,10 @@ def main():
         # the workbench, ground_pcd is empty and this is a no-op merge
         # (room_pcd already contains the floor since it was never removed).
         room_pcd = _merge_pcds(room_pcd, ground_pcd)
+
+        # Cover the hollow gap the object leaves behind so it doesn't show
+        # once the object is picked up and moved elsewhere in the viewer.
+        room_pcd = fill_object_hole(room_pcd, obj_pcd)
 
         print(f"Object selection: {len(obj_pcd.points):,} pts. "
               f"Room + floor: {len(room_pcd.points):,} pts.")
