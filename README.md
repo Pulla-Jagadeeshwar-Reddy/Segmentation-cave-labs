@@ -5,17 +5,17 @@ scanned room (as a splat/point cloud `.ply`), isolating an object inside it via
 clustering, and repositioning, relighting, or extracting that object as a
 standalone splat.
 
-The core entry point is `scene_composer.py`, which combines DBSCAN-based
+The core entry point is `SC_final.py`, which combines DBSCAN-based
 object selection with PCA Gaussian fitting and an interactive Open3D viewer for
 moving, rotating, and relighting the selected object before exporting the
 result as a standard 3DGS `.ply`. The other `scene_composer_*` scripts are
 earlier iterations of the same pipeline (different rendering backends), kept
-for reference — `scene_composer.py` is the one to use.
+for reference — `SC_final.py` is the one to use.
 
 See `3D-Gaussian-Splat-Scene-Editing-Pipeline.pdf` / `.pptx` for the design
 writeup behind this pipeline.
 
-# scene_composer.py
+# SC_final.py
 
 Glue script that ties together a room/environment point cloud, DBSCAN
 clustering, and PCA-based Gaussian splat fitting into one interactive
@@ -70,8 +70,8 @@ completes.
 ## Usage
 
 ```bash
-python scene_composer.py <room.ply>
-python scene_composer.py                     # opens a file dialog instead
+python SC_final.py <room.ply>
+python SC_final.py                     # opens a file dialog instead
 ```
 
 ### Command-line flags
@@ -139,7 +139,7 @@ Pass `--no-light` on the command line to turn the whole lighting/shading
 system off:
 
 ```bash
-python scene_composer.py <room.ply> --no-light
+python SC_final.py <room.ply> --no-light
 ```
 
 With lighting disabled:
@@ -159,7 +159,7 @@ checked at the top of `_apply_occlusion_shading()`.
 ## Light control panel (`--light-gui`)
 
 ```bash
-python scene_composer.py <room.ply> --light-gui
+python SC_final.py <room.ply> --light-gui
 ```
 
 Adds a small tkinter side panel (same toolkit as the cluster picker)
@@ -218,3 +218,45 @@ On export:
   (`_ensure()`)
 - `point_cloud_gui.py` and `gaussian_splat_render.py` must be present in
   the same directory
+## Setup
+
+### Requirements
+- Python 3.9+
+- `numpy`, `open3d`, `matplotlib`
+- `tkinter` (usually bundled with Python; on Linux you may need `sudo apt install python3-tk`)
+- `scipy` and `plyfile` — auto-installed on first run if missing
+
+### Installation
+
+```bash
+git clone https://github.com/Pulla-Jagadeeshwar-Reddy/Segmentation-cave-labs.git
+cd Segmentation-cave-labs
+
+python -m venv venv
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # macOS/Linux
+
+pip install numpy open3d matplotlib
+```
+
+`scipy` and `plyfile` will be installed automatically the first time you run
+`SC_final.py` if they aren't already present.
+
+`point_cloud_gui.py` and `gaussian_splat_render.py` must be in the same
+directory as `SC_final.py` — they're imported as sibling modules, not
+installed as packages.
+
+### Windows notes
+- If `pip install` fails with a path-length error, enable long paths:
+  `git config --system core.longpaths true`, or enable it in Windows via
+  `gpedit.msc` / registry (`LongPathsEnabled`).
+- Run the venv activation and script from **Command Prompt** or PowerShell —
+  if you hit strange `python`/`pip` "not recognized" errors, check that
+  Python's install path (not just the `Scripts` folder) is on your `PATH`.
+
+### Running it
+
+```bash
+python SC_final.py <room.ply>
+python SC_final.py                  # opens a file dialog instead
+```
