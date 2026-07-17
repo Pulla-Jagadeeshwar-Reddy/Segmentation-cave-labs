@@ -46,10 +46,6 @@ writeup behind this pipeline.
 ![Object Repositioning](assets/object_reposition.png)
 *Object translated/rotated about its own centroid.*
 
-### Lighting
-![Lighting Demo](assets/lighting_demo.png)
-*Point light vs. directional light shading comparison.*
-
 ### Exported Result
 ![Exported Splat](assets/exported_result.png)
 *Final `.ply` reopened in an external Gaussian splat viewer.*
